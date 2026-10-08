@@ -15,6 +15,20 @@ import { dirname, join } from "node:path";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
+export interface HostConfig {
+	/** Directory on the remote host under which synced work directories are placed. */
+	remoteRoot: string;
+	/** Extra rsync exclude patterns for the work-directory sync. */
+	syncExcludes?: string[];
+}
+
+export interface SubagentConfig {
+	hosts?: Record<string, HostConfig>;
+}
+
+export const REMOTE_CLI = "~/.pi/agent/bin/subagent";
+export const REMOTE_EXTENSION_DIR = "~/.pi/agent/extensions/subagent";
+
 export interface RunMetadata {
 	version: 1;
 	handle: string;
@@ -22,6 +36,12 @@ export interface RunMetadata {
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
+	/** ssh alias of the host this run executes on; absent for local runs. */
+	host?: string;
+	/** Working directory on the remote host (mirrors cwd for local runs). */
+	remoteCwd?: string;
+	/** Local directory that was synced to remoteCwd at spawn time. */
+	syncSource?: string;
 	tmuxSession: string;
 	runDir: string;
 	sessionFile: string;
@@ -66,6 +86,26 @@ interface AssistantEntry extends SessionEntry {
 
 export function getAgentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
+/** Host entries from <agentDir>/subagent.json: ssh alias -> remoteRoot and sync excludes. */
+export function loadHosts(): Record<string, HostConfig> {
+	const path = join(getAgentDir(), "subagent.json");
+	try {
+		const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof value !== "object" || value === null) return {};
+		const hosts = (value as Partial<SubagentConfig>).hosts;
+		if (typeof hosts !== "object" || hosts === null) return {};
+		const result: Record<string, HostConfig> = {};
+		for (const [name, config] of Object.entries(hosts)) {
+			if (typeof config !== "object" || config === null || typeof config.remoteRoot !== "string") continue;
+			result[name] = { remoteRoot: config.remoteRoot, syncExcludes: config.syncExcludes };
+		}
+		return result;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw new Error(`Could not parse ${path}: ${error instanceof Error ? error.message : String(error)}`);
+	}
 }
 
 export function getRunsDir(): string {
@@ -199,14 +239,41 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
 }
 
+export function isRemote(metadata: RunMetadata): boolean {
+	return typeof metadata.host === "string" && metadata.host.length > 0;
+}
+
 export function effectiveRunState(metadata: RunMetadata): RunState {
+	// Remote runs live in the remote host's tmux server; local tmux knows nothing about them.
 	if (
+		!isRemote(metadata) &&
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
 		!tmuxSessionExists(metadata.tmuxSession)
 	) {
 		return "exited";
 	}
 	return metadata.state;
+}
+
+export const SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
+
+/** Quote a value for embedding in a POSIX shell command run over ssh. */
+export function shq(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** Run a shell command on a remote host (BatchMode). Returns stdout on success. */
+export function runRemote(host: string, command: string): string {
+	const result = spawnSync("ssh", [...SSH_OPTIONS, host, command], { encoding: "utf8" });
+	if (result.status !== 0) {
+		const detail = (result.stderr || "").trim() || `ssh exited with ${result.status}`;
+		throw new Error(`Remote command on ${host} failed: ${detail}`);
+	}
+	return result.stdout;
+}
+
+export function remoteAttachCommand(metadata: RunMetadata): string {
+	return `ssh -t ${metadata.host} tmux attach-session -t ${shq(metadata.tmuxSession)}`;
 }
 
 export function listRuns(parentSessionId?: string): RunMetadata[] {

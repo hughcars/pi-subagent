@@ -7,9 +7,11 @@ import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendi
 import {
 	effectiveRunState,
 	inboxDir,
+	isRemote,
 	launchRun,
 	listRuns,
 	readMetadata,
+	REMOTE_CLI,
 	removeRunDir,
 	runDisplayName,
 	type InboxMessage,
@@ -48,7 +50,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 			const items: SelectItem[] = runs.map((run) => ({
 				value: run.handle,
-				label: `${runDisplayName(run)}  ${displayState(run)}  ${run.provider}/${run.model}  ${run.thinking}`,
+				label: `${runDisplayName(run)}  ${displayState(run)}  ${run.provider}/${run.model}  ${run.thinking}${isRemote(run) ? `  @${run.host}` : ""}`,
 			}));
 			let tui: TUI | undefined;
 			const selected = await ctx.ui.custom<string | undefined>((customTui, theme, _keybindings, done) => {
@@ -92,6 +94,26 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const run = runs.find((candidate) => candidate.handle === selected);
 			if (!run) return;
 
+			if (isRemote(run)) {
+				tui.stop();
+				try {
+					const exitCode = await new Promise<number | null>((resolveExit) => {
+						const child = spawn(
+							"ssh",
+							["-t", run.host as string, "tmux", "attach-session", "-t", run.tmuxSession],
+								{ stdio: "inherit" },
+							);
+						child.on("error", () => resolveExit(null));
+						child.on("close", resolveExit);
+					});
+					if (exitCode !== 0) process.stderr.write(`Could not attach to ${run.handle} on ${run.host}\n`);
+				} finally {
+					tui.start();
+					tui.requestRender(true);
+				}
+				return;
+			}
+
 			if (process.env.TMUX) {
 				const exitCode = await new Promise<number | null>((resolveExit) => {
 					const child = spawn("tmux", ["switch-client", "-t", run.tmuxSession], { stdio: "inherit" });
@@ -120,6 +142,64 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	if (!runDir) {
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
 		let widgetContext: ExtensionContext | undefined;
+		const REMOTE_POLL_MS = 20000;
+		let remoteRefreshBusy = false;
+
+		// Remote runs live in the host's tmux server; poll their real states over ssh so the
+		// widget and picker stay truthful. Runs stopped on the host side are dropped here.
+		const refreshRemoteStates = (): void => {
+			if (remoteRefreshBusy || !widgetContext) return;
+			const remoteRuns = listRuns(widgetContext.sessionManager.getSessionId()).filter(isRemote);
+			if (remoteRuns.length === 0) return;
+			remoteRefreshBusy = true;
+			const byHost = new Map<string, RunMetadata[]>();
+			for (const run of remoteRuns) {
+				const host = run.host as string;
+				const group = byHost.get(host) ?? [];
+				group.push(run);
+				byHost.set(host, group);
+			}
+			void (async () => {
+				for (const [host, runs] of byHost) {
+					try {
+						const child = spawn("ssh", [
+							"-o",
+							"BatchMode=yes",
+							"-o",
+							"ConnectTimeout=10",
+							host,
+							`${REMOTE_CLI} list --json`,
+						]);
+						let stdout = "";
+						child.stdout?.on("data", (chunk) => {
+								stdout += String(chunk);
+							});
+						const code = await new Promise<number | null>((resolveExit) => {
+							child.on("error", () => resolveExit(null));
+							child.on("close", resolveExit);
+						});
+						if (code !== 0) continue;
+						const remoteAll = JSON.parse(stdout) as RunMetadata[];
+						for (const run of runs) {
+								const match = remoteAll.find((candidate) => candidate.handle === run.handle);
+								if (match) {
+									updateMetadata(run.runDir, {
+										state: match.state,
+									error: match.error,
+									hasStarted: match.hasStarted,
+									});
+								} else {
+									removeRunDir(run.runDir);
+								}
+							}
+						} catch {
+						// ssh or JSON failure: keep the last known states rather than guessing.
+						}
+					}
+					remoteRefreshBusy = false;
+					refreshWidget();
+				})();
+			};
 
 		const refreshWidget = (): void => {
 			if (!widgetContext) return;
@@ -134,7 +214,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const visible = activeRuns.slice(0, 5).map(({ run, state }) => {
 				const color =
 					state === "busy" ? "warning" : state === "idle" ? "success" : state === "error" ? "error" : "muted";
-				return widgetContext!.ui.theme.fg(color, `${run.name ?? run.handle}:${state}`);
+				const suffix = isRemote(run) ? `@${run.host}` : "";
+				return widgetContext!.ui.theme.fg(color, `${run.name ?? run.handle}:${state}${suffix}`);
 			});
 			if (activeRuns.length > visible.length) {
 				visible.push(widgetContext.ui.theme.fg("muted", `+${activeRuns.length - visible.length}`));
@@ -148,7 +229,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 		pi.on("session_start", (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
+			// Remote children were never suspended: they keep running on their host across parent restarts.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
+				if (isRemote(run)) continue;
 				if (!run.suspended || tmuxSessionExists(run.tmuxSession)) continue;
 				if (!existsSync(run.sessionFile)) {
 					removeRunDir(run.runDir);
@@ -167,7 +250,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!ctx.hasUI) return;
 			widgetContext = ctx;
 			refreshWidget();
-			widgetTimer = setInterval(refreshWidget, 1000);
+			refreshRemoteStates();
+			widgetTimer = setInterval(() => {
+				refreshWidget();
+				if (Date.now() % REMOTE_POLL_MS < 1000) refreshRemoteStates();
+			}, 1000);
 			widgetTimer.unref();
 		});
 
@@ -179,7 +266,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (event.reason === "reload") return;
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
+			// Remote children are left running on their host; their shadow metadata is kept so
+			// status/send/wait/attach keep working after the parent resumes.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
+				if (isRemote(run)) continue;
 				if (!tmuxSessionExists(run.tmuxSession)) {
 					if (!run.suspended) removeRunDir(run.runDir);
 					continue;

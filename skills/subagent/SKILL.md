@@ -90,4 +90,30 @@ subagent stop <handle>
 
 Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates tmux and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
 
+## Remote hosts
+
+A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, wait, stop, rename) is transparently forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t <host>`.
+
+Hosts are configured in `~/.pi/agent/subagent.json`:
+
+```json
+{
+  "hosts": {
+    "<ssh-alias>": { "remoteRoot": "~/subagent-work", "syncExcludes": ["build"] }
+  }
+}
+```
+
+The ssh alias must work non-interactively (BatchMode) and carries the transport — an SSM ProxyCommand entry is fine. The host needs `pi`, `tmux`, `rsync`, and node >= 22.19; the subagent extension itself is copied over and linked automatically on first use.
+
+```sh
+# Spawn on a host; --cwd is rsynced to <remoteRoot>/<basename> unless --remote-cwd overrides it.
+subagent spawn --host <ssh-alias> --name build --prompt "Run the tests"
+
+# Results never sync back automatically; fetch them explicitly (default: ~/subagent-results/<name>).
+subagent fetch <handle> [dest]
+```
+
+Remote children keep running when the parent session quits; their state is polled over ssh every 20s and they are never suspended. They only end when stopped or the host goes away. Fetch before stopping if the remote working directory matters; `stop` removes the run on the host.
+
 The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.
