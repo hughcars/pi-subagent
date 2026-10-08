@@ -315,6 +315,8 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 	const excludes = [...DEFAULT_SYNC_EXCLUDES, ...(config.syncExcludes ?? [])];
 
 	provisionRemote(host);
+	// rsync only creates the last path component; create the full base first.
+	runRemote(host, `mkdir -p ${shq(remoteBase)}`);
 	rsyncToHost(srcDir, host, remoteBase, excludes);
 
 	// Map --file arguments to paths on the host: files inside the synced tree keep their
