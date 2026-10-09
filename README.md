@@ -81,3 +81,32 @@ Optional spawn flags:
 - `--no-context-files`: ignore repository instruction files
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+
+## Remote hosts
+
+A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, wait, stop, rename) is forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t`. Hosts are configured in `~/.pi/agent/subagent.json`:
+
+```json
+{
+  "hosts": {
+    "<ssh-alias>": {
+      "remoteRoot": "~/subagent-work",
+      "provider": "<provider-on-that-host>",
+      "model": "<model-on-that-host>",
+      "thinking": "high"
+    }
+  }
+}
+```
+
+The ssh alias must work non-interactively (BatchMode) and carries the transport — an SSM ProxyCommand entry is fine. The host needs `pi`, `tmux`, `rsync`, and node >= 22.19; the extension copies itself over and links the CLI automatically on first use. A host's `provider`/`model`/`thinking` are the spawn defaults when no explicit flags are passed, so `subagent spawn --host <alias> --name work --prompt ...` is all it takes.
+
+`subagent fetch <handle> [dest]` rsyncs results back explicitly — nothing syncs back on its own. On a host with an AWS instance profile, the child's credentials never expire: Bedrock Converse signs via the ambient IMDS chain.
+
+`subagent hosts` lists the configured registry with live reachability and active run counts, so callers can discover usable hosts before spawning. Creating new compute is not this tool's job — discover first, provision only when nothing is usable.
+
+`subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, transcript, metadata, and — for remote runs — the synced work directory. Default grace is 900 seconds; `--force` tears down immediately. Children never terminate on a timer: only a supervisor's close ends them.
+
+## License
+
+MIT. This fork is based on [badlogic/pi-subagent](https://github.com/badlogic/pi-subagent) by Mario Zechner, who wrote the original tool; the remote-host execution feature was added here. Original code © Mario Zechner, fork changes © Hugh Cars — see [LICENSE](LICENSE).
