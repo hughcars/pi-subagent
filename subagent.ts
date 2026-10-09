@@ -102,6 +102,10 @@ function spawnSubagent(args: string[]): void {
 	let provider = process.env.PI_PROVIDER;
 	let model = process.env.PI_MODEL;
 	let thinking = process.env.PI_REASONING_LEVEL || "medium";
+	// Explicit flags must win over per-host defaults in remote spawns; ambient env must not.
+	let providerExplicit = false;
+	let modelExplicit = false;
+	let thinkingExplicit = false;
 	let cwd = process.cwd();
 	let tools: string | undefined;
 	let noExtensions = false;
@@ -128,14 +132,17 @@ function spawnSubagent(args: string[]): void {
 				break;
 			case "--provider":
 				provider = valueAfter(args, i, arg);
+				providerExplicit = true;
 				i++;
 				break;
 			case "--model":
 				model = valueAfter(args, i, arg);
+				modelExplicit = true;
 				i++;
 				break;
 			case "--thinking":
 				thinking = valueAfter(args, i, arg);
+				thinkingExplicit = true;
 				i++;
 				break;
 			case "--cwd":
@@ -188,6 +195,9 @@ function spawnSubagent(args: string[]): void {
 			provider,
 			model,
 			thinking,
+			providerExplicit,
+			modelExplicit,
+			thinkingExplicit,
 			cwd,
 			tools,
 			noExtensions,
@@ -255,6 +265,10 @@ interface RemoteSpawnOptions {
 	provider: string;
 	model: string;
 	thinking: string;
+	/** Whether --provider/--model/--thinking were passed explicitly (flags win over host defaults). */
+	providerExplicit: boolean;
+	modelExplicit: boolean;
+	thinkingExplicit: boolean;
 	cwd: string;
 	tools?: string;
 	noExtensions: boolean;
@@ -307,6 +321,12 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 		const known = Object.keys(hosts).join(", ") || "none configured";
 		fail(`Unknown subagent host: ${host} (known: ${known}). Configure hosts in ${join(getAgentDir(), "subagent.json")}`);
 	}
+	// Explicit spawn flags win; otherwise a host default replaces the local ambient
+	// provider/model, which may not exist on the remote machine.
+	const provider = options.providerExplicit || !config.provider ? options.provider : config.provider;
+	const model = options.modelExplicit || !config.model ? options.model : config.model;
+	const thinking = options.thinkingExplicit || !config.thinking ? options.thinking : config.thinking;
+
 	const srcDir = resolve(options.cwd);
 	const remoteHome = runRemote(host, "echo $HOME").trim();
 	const expandRemote = (path: string): string =>
@@ -337,7 +357,7 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 
 	const cliArgs = [REMOTE_CLI, "spawn"];
 	if (options.name) cliArgs.push("--name", options.name);
-	cliArgs.push("--provider", options.provider, "--model", options.model, "--thinking", options.thinking);
+	cliArgs.push("--provider", provider, "--model", model, "--thinking", thinking);
 	cliArgs.push("--cwd", remoteBase);
 	if (options.tools) cliArgs.push("--tools", options.tools);
 	if (options.noExtensions) cliArgs.push("--no-extensions");
@@ -369,6 +389,9 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 		syncSource: srcDir,
 		runDir,
 		cwd: srcDir,
+		provider,
+		model,
+		thinking,
 		parentSessionId: process.env.PI_SESSION_ID || undefined,
 		parentSessionFile: process.env.PI_SESSION_FILE || undefined,
 	};

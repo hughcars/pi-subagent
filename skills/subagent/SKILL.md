@@ -94,17 +94,25 @@ Explicitly stop every subagent when it is no longer needed; do not leave complet
 
 A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, wait, stop, rename) is transparently forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t <host>`.
 
-Hosts are configured in `~/.pi/agent/subagent.json`:
+Hosts are configured in `~/.pi/agent/subagent.json`; read that file to see which hosts exist before spawning remotely:
 
 ```json
 {
   "hosts": {
-    "<ssh-alias>": { "remoteRoot": "~/subagent-work", "syncExcludes": ["build"] }
+    "<ssh-alias>": {
+      "remoteRoot": "~/subagent-work",
+      "syncExcludes": ["build"],
+      "provider": "<provider-on-that-host>",
+      "model": "<model-on-that-host>",
+      "thinking": "high"
+    }
   }
 }
 ```
 
 The ssh alias must work non-interactively (BatchMode) and carries the transport — an SSM ProxyCommand entry is fine. The host needs `pi`, `tmux`, `rsync`, and node >= 22.19; the subagent extension itself is copied over and linked automatically on first use.
+
+A host entry's `provider`/`model`/`thinking` are the defaults when spawn passes no explicit `--provider`/`--model`/`--thinking`; without them the local session's ambient model would be forwarded and may not exist on the host. When a configured host declares a model, spawning needs nothing more than `--host`:
 
 ```sh
 # Spawn on a host; --cwd is rsynced to <remoteRoot>/<basename> unless --remote-cwd overrides it.
@@ -113,6 +121,8 @@ subagent spawn --host <ssh-alias> --name build --prompt "Run the tests"
 # Results never sync back automatically; fetch them explicitly (default: ~/subagent-results/<name>).
 subagent fetch <handle> [dest]
 ```
+
+Remote `wait` blocks an ssh call for up to its timeout; when a result is not needed in the current turn, run it as a background process instead (e.g. through the process tool) and let its completion notification deliver the result.
 
 Remote children keep running when the parent session quits; their state is polled over ssh every 20s and they are never suspended. They only end when stopped or the host goes away. Fetch before stopping if the remote working directory matters; `stop` removes the run on the host.
 

@@ -20,6 +20,12 @@ export interface HostConfig {
 	remoteRoot: string;
 	/** Extra rsync exclude patterns for the work-directory sync. */
 	syncExcludes?: string[];
+	/** Default provider on this host when spawn did not pass --provider explicitly. */
+	provider?: string;
+	/** Default model on this host when spawn did not pass --model explicitly. */
+	model?: string;
+	/** Default thinking level on this host when spawn did not pass --thinking explicitly. */
+	thinking?: string;
 }
 
 export interface SubagentConfig {
@@ -99,7 +105,13 @@ export function loadHosts(): Record<string, HostConfig> {
 		const result: Record<string, HostConfig> = {};
 		for (const [name, config] of Object.entries(hosts)) {
 			if (typeof config !== "object" || config === null || typeof config.remoteRoot !== "string") continue;
-			result[name] = { remoteRoot: config.remoteRoot, syncExcludes: config.syncExcludes };
+			result[name] = {
+				remoteRoot: config.remoteRoot,
+				syncExcludes: config.syncExcludes,
+				provider: config.provider,
+				model: config.model,
+				thinking: config.thinking,
+			};
 		}
 		return result;
 	} catch (error) {
