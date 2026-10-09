@@ -13,7 +13,16 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
+export type RunState = "starting" | "busy" | "idle" | "closing" | "exited" | "error";
+
+/** Default seconds `stop` waits for a closing subagent's final cleanup turn. */
+export const DEFAULT_GRACE_SECONDS = 900;
+
+/** Delivered to a subagent when its supervisor stops it: clean up, then report. */
+export const CLOSE_MESSAGE =
+	"Supervisor close: this subagent is being closed by its supervisor. Stop starting new work. " +
+	"Clean up after yourself: kill any background processes you started and remove temporary or scratch files you created that are not part of the deliverable. " +
+	"Then write your final report: what you did, what is left unfinished, and anything the supervisor should know.";
 
 export interface HostConfig {
 	/** Directory on the remote host under which synced work directories are placed. */
@@ -59,6 +68,8 @@ export interface RunMetadata {
 	launchArgs?: string[];
 	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
 	suspended?: boolean;
+	/** Set when a supervisor close was delivered; the child exits after its final cleanup turn. */
+	closing?: boolean;
 	state: RunState;
 	hasStarted: boolean;
 	createdAt: string;
@@ -68,7 +79,8 @@ export interface RunMetadata {
 
 export interface InboxMessage {
 	message: string;
-	delivery: "auto" | "followUp";
+	/** auto: send now (steer if busy). followUp: queue for after the current turn. close: supervisor close, exits the child when the final turn settles. */
+	delivery: "auto" | "followUp" | "close";
 }
 
 interface SessionEntry {

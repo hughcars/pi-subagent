@@ -26,7 +26,10 @@ const packageDir = dirname(fileURLToPath(import.meta.url));
 function isInboxMessage(value: unknown): value is InboxMessage {
 	if (typeof value !== "object" || value === null) return false;
 	const message = value as Record<string, unknown>;
-	return typeof message.message === "string" && (message.delivery === "auto" || message.delivery === "followUp");
+	return (
+		typeof message.message === "string" &&
+		(message.delivery === "auto" || message.delivery === "followUp" || message.delivery === "close")
+	);
 }
 
 function displayState(metadata: RunMetadata): string {
@@ -213,7 +216,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 			const visible = activeRuns.slice(0, 5).map(({ run, state }) => {
 				const color =
-					state === "busy" ? "warning" : state === "idle" ? "success" : state === "error" ? "error" : "muted";
+					state === "busy" || state === "closing"
+						? "warning"
+						: state === "idle"
+							? "success"
+							: state === "error"
+								? "error"
+								: "muted";
 				const suffix = isRemote(run) ? `@${run.host}` : "";
 				return widgetContext!.ui.theme.fg(color, `${run.name ?? run.handle}:${state}${suffix}`);
 			});
@@ -285,6 +294,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let currentContext: ExtensionContext | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let processing = false;
+	let closeRequested = false;
 	let sessionName: string | undefined;
 
 	const syncSessionName = (): void => {
@@ -321,13 +331,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					continue;
 				}
 
-				updateMetadata(runDir, { state: "busy", error: undefined });
+				if (payload.delivery === "close") closeRequested = true;
+				updateMetadata(runDir, {
+					state: "busy",
+					error: undefined,
+					closing: payload.delivery === "close" ? true : undefined,
+				});
 				try {
 					if (currentContext.isIdle()) {
 						pi.sendUserMessage(payload.message);
 					} else {
+						// A close never interrupts running work: the supervisor gets the
+						// current turn plus the cleanup turn, then the child exits.
 						pi.sendUserMessage(payload.message, {
-							deliverAs: payload.delivery === "followUp" ? "followUp" : "steer",
+							deliverAs: payload.delivery === "auto" ? "steer" : "followUp",
 						});
 					}
 					unlinkSync(path);
@@ -371,6 +388,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("agent_settled", (_event, ctx) => {
 		currentContext = ctx;
 		if (ctx.isIdle()) updateMetadata(runDir, { state: "idle" });
+		// The supervisor closed this run and its final cleanup turn has settled:
+		// the child has nothing left to do. The session file is append-durable, so
+		// exiting here ends the tmux session and lets stop's teardown complete.
+		if (closeRequested && ctx.isIdle()) {
+			updateMetadata(runDir, { state: "exited" });
+			process.exit(0);
+		}
 	});
 
 	pi.on("session_shutdown", (event) => {

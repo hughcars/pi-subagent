@@ -8,6 +8,8 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	assistantText,
+	CLOSE_MESSAGE,
+	DEFAULT_GRACE_SECONDS,
 	effectiveRunState,
 	getAgentDir,
 	getRunsDir,
@@ -51,8 +53,9 @@ function usage(): never {
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
   subagent wait <handle> [--timeout <seconds>]
-  subagent stop <handle>
+  subagent stop <handle> [--grace <seconds>] [--force]
   subagent fetch <handle> [dest]
+  subagent hosts
   subagent list [--json]
 
 Remote hosts:
@@ -524,20 +527,127 @@ async function waitSubagent(args: string[]): Promise<void> {
 	fail(`Timed out after ${timeoutSeconds}s waiting for ${handle}`);
 }
 
+function parseStopArgs(args: string[]): { handle: string; grace: number; force: boolean } {
+	const handle = args.shift();
+	if (!handle) usage();
+	let grace = DEFAULT_GRACE_SECONDS;
+	let force = false;
+	while (args.length > 0) {
+		const arg = args.shift() as string;
+		if (arg === "--force") force = true;
+		else if (arg === "--grace") {
+			const value = args.shift();
+		if (!value || !/^\d+$/.test(value)) fail("--grace requires a positive integer seconds value");
+			grace = Number(value);
+		} else fail(`Unknown stop argument: ${arg}`);
+	}
+	return { handle, grace, force };
+}
+
+/** Close one running subagent: deliver the cleanup prompt, wait for its final turn. Returns the final report. */
+async function closeSubagent(metadata: RunMetadata, grace: number): Promise<string | undefined> {
+	updateMetadata(metadata.runDir, { state: "closing", closing: true });
+	const queueDir = inboxDir(metadata.runDir);
+	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
+	const id = `${Date.now()}-${randomBytes(4).toString("hex")}`;
+	const target = join(queueDir, `${id}.json`);
+	const temporary = `${target}.tmp`;
+	const payload: InboxMessage = { message: CLOSE_MESSAGE, delivery: "close" };
+	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
+	renameSync(temporary, target);
+
+	const deadline = Date.now() + grace * 1000;
+	while (Date.now() < deadline) {
+		if (!tmuxSessionExists(metadata.tmuxSession)) {
+			// The child finished its cleanup turn and exited.
+			const message = readLatestAssistant(metadata.sessionFile);
+			return message ? assistantText(message) : undefined;
+		}
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+	}
+	return undefined;
+}
+
 async function stopSubagent(args: string[]): Promise<void> {
-	if (args.length !== 1) usage();
-	const metadata = getRun(args[0]);
+	const { handle, grace, force } = parseStopArgs(args);
+	const metadata = getRun(handle);
 	if (isRemote(metadata)) {
-		runRemote(metadata.host as string, `${REMOTE_CLI} stop ${shq(metadata.handle)}`);
+		// The synced work tree is the parent's responsibility: it was the parent that
+		// put it there. Validate (and clean) only trees the parent placed under the host's root.
+		let removeWorkdir: (() => void) | undefined;
+		if (!force) {
+			const hosts = loadHosts();
+			const config = hosts[metadata.host as string];
+			const remoteCwd = metadata.remoteCwd;
+			if (config && remoteCwd) {
+				const remoteHome = runRemote(metadata.host as string, "echo $HOME").trim();
+				const root =
+					config.remoteRoot === "~"
+						? remoteHome
+						: config.remoteRoot.startsWith("~/")
+							? `${remoteHome}/${config.remoteRoot.slice(2)}`
+							: config.remoteRoot;
+				if (remoteCwd === root || !remoteCwd.startsWith(`${root}/`)) {
+						fail(`Refusing to clean remote work dir ${remoteCwd}: not under ${root}`);
+				}
+				const workdir = remoteCwd;
+				removeWorkdir = () => runRemote(metadata.host as string, `rm -rf ${shq(workdir)}`);
+			}
+		}
+		const remoteArgs = [REMOTE_CLI, "stop", shq(metadata.handle)];
+		if (force) remoteArgs.push("--force");
+		else remoteArgs.push("--grace", String(grace));
+		const remoteOutput = runRemote(metadata.host as string, remoteArgs.join(" "));
+		if (removeWorkdir) removeWorkdir();
 		removeRunDir(metadata.runDir);
-		process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+		process.stdout.write(remoteOutput);
 		return;
+	}
+
+	if (!force && tmuxSessionExists(metadata.tmuxSession)) {
+		const report = await closeSubagent(metadata, grace);
+		if (report !== undefined) {
+			process.stdout.write(`${handle} closed\n\n${report}\n`);
+		} else {
+			process.stdout.write(
+				`${handle} did not finish its cleanup turn within ${grace}s; forcing teardown. Its remote work dir (if any) was left in place.\n`,
+			);
+		}
 	}
 	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
 	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
 	removeRunDir(metadata.runDir);
-	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+	if (force || !wasRunning) process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+}
+
+function hostsSubagent(): void {
+	const hosts = loadHosts();
+	const names = Object.keys(hosts).sort();
+	if (names.length === 0) {
+		process.stdout.write(
+			`No hosts configured. Add entries to ${join(getAgentDir(), "subagent.json")}:\n{ "hosts": { "<ssh-alias>": { "remoteRoot": "~/subagent-work" } } }\n`,
+		);
+		return;
+	}
+	for (const name of names) {
+		const config = hosts[name];
+		const reachable =
+			spawnSync("ssh", [...SSH_OPTIONS, name, "true"], { stdio: "ignore" }).status === 0;
+		let runs = "unknown";
+		if (reachable) {
+			try {
+				const output = runRemote(name, `${REMOTE_CLI} list --json`);
+				runs = String((JSON.parse(output) as RunMetadata[]).length);
+			} catch {
+				runs = "no CLI (prerequisite check runs at spawn)";
+			}
+		}
+		const model = config.provider && config.model ? `${config.provider}/${config.model}` : "(host default missing: pass --provider/--model)";
+		process.stdout.write(
+			`${name}  ${config.remoteRoot}  ${model}  ${reachable ? "reachable" : "unreachable"}  runs:${runs}\n`,
+		);
+	}
 }
 
 function fetchSubagent(args: string[]): void {
@@ -599,6 +709,9 @@ async function main(): Promise<void> {
 			break;
 		case "stop":
 			await stopSubagent(args);
+			break;
+		case "hosts":
+			hostsSubagent();
 			break;
 		case "fetch":
 			fetchSubagent(args);

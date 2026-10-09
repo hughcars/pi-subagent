@@ -85,10 +85,10 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 ## Stop
 
 ```sh
-subagent stop <handle>
+subagent stop <handle> [--grace <seconds>] [--force]
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates tmux and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+`stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files it created) and write a closing report, which `stop` prints. The child then exits and its tmux session, transcript, and metadata are removed. Default grace is 900s; `--force` skips the cleanup turn and tears down immediately — use it for wedged children. Stop every subagent when its work is done; keep an idle one alive only when concrete follow-up work is expected.
 
 ## Remote hosts
 
@@ -124,6 +124,8 @@ subagent fetch <handle> [dest]
 
 Remote `wait` blocks an ssh call for up to its timeout; when a result is not needed in the current turn, run it as a background process instead (e.g. through the process tool) and let its completion notification deliver the result.
 
-Remote children keep running when the parent session quits; their state is polled over ssh every 20s and they are never suspended. They only end when stopped or the host goes away. Fetch before stopping if the remote working directory matters; `stop` removes the run on the host.
+Remote children keep running when the parent session quits; their state is polled over ssh every 20s and they are never suspended. They only end when stopped or the host goes away. For a remote run, `stop` deletes the synced work directory on the host after the cleanup turn — **fetch first if you need any artifacts**, because nothing is archived. Runs forced with `--force`, or closed past the grace window, leave the remote work directory in place.
+
+`subagent hosts` lists the configured remote registry: each host's remoteRoot and model defaults, whether it is reachable, and how many runs it has active. Run it before spawning remotely; it tells you which hosts exist and whether they are usable. Creating new compute (e.g. an EC2 box) is not this tool's job — discover existing hosts first and only provision new machines when none are usable, and stop instances you spawned once their runs are done.
 
 The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.
