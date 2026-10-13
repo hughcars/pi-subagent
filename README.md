@@ -63,10 +63,27 @@ subagent status a1b2c3
 subagent rename a1b2c3 "error handling review"
 subagent send a1b2c3 "Focus on error handling"
 subagent send a1b2c3 --follow-up "Then summarize"
+subagent interrupt a1b2c3
 subagent wait a1b2c3
 subagent stop a1b2c3
 subagent list
 ```
+
+### Interrupt
+
+`subagent interrupt <handle>` presses Escape once in the child's tmux pane (`tmux send-keys Escape`), the same as attaching and pressing Escape by hand. It then waits up to 10 seconds for the child to settle and prints its state. Use it to unblock a stuck child. `send` cannot do this, because a message to a busy child waits behind the running tool call. `stop` cannot do it either: it ends the child, and its graceful close also waits for the current turn.
+
+What Escape does depends on the child's state:
+
+| Child state | Effect of `interrupt` |
+|---|---|
+| Running a tool (bash, `process wait`) or streaming | Aborts the turn. The transcript records the tool as aborted, or keeps the partial answer with `stopReason: aborted`. The child goes idle. Background processes started with the `process` tool keep running. `wait` then prints the aborted turn and exits 1. |
+| Open dialog (e.g. the `question` tool) | Cancels only the dialog. The tool returns "cancelled" and the turn continues, so the child can still be busy when `interrupt` returns. |
+| Idle | No effect. Two Escapes within 0.5 s run pi's double-Escape action (the session tree by default). One more Escape closes it. |
+
+**Queued messages are not delivered.** If you `send` (steer or `--follow-up`) to a busy child and then `interrupt` an aborting turn, pi moves every queued message into the child's editor. It does not send them. They stay there until someone presses Enter in the pane. Later `send` calls do not flush them. To get them through, send them again after the interrupt. In the dialog case, Escape does not reach the editor, so queued messages are delivered when the turn continues.
+
+After an interrupt, the child takes `send` as normal.
 
 Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
 
@@ -84,7 +101,7 @@ Nested subagents are disabled. Child sessions do not receive the subagent skill.
 
 ## Remote hosts
 
-A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, wait, stop, rename) is forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t`. Hosts are configured in `~/.pi/agent/subagent.json`:
+A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, interrupt, wait, stop, rename) is forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t`. Hosts are configured in `~/.pi/agent/subagent.json`:
 
 ```json
 {

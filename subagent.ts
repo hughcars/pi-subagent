@@ -52,11 +52,20 @@ function usage(): never {
   subagent status <handle> [--json]
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
+  subagent interrupt <handle>
   subagent wait <handle> [--timeout <seconds>]
   subagent stop <handle> [--grace <seconds>] [--force]
   subagent fetch <handle> [dest]
   subagent hosts
   subagent list [--json]
+
+Interrupt presses Escape once in the child's pane, exactly as a human attached to it would.
+  A running turn (bash, process wait, streaming) is aborted; background processes keep running.
+  Messages queued by send while the child was busy are NOT delivered: they move into the
+  child's editor. In an open dialog (question tool) Escape only cancels the dialog, and the
+  turn continues with any queued message. Idle: no effect, but two interrupts within 0.5s
+  trigger pi's double-Escape action (the session tree by default); one more closes it.
+  Use send to redirect work and stop to end it.
 
 Remote hosts:
   subagent spawn --host <ssh-alias> [--remote-cwd <dir>] ...   rsyncs --cwd to the host first
@@ -474,6 +483,39 @@ function sendSubagent(args: string[]): void {
 	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n`);
 }
 
+/** Upper bound on how long `interrupt` waits for the child to settle before reporting its state. */
+const INTERRUPT_SETTLE_SECONDS = 10;
+
+/**
+ * Press Escape in the child's pane. Deliberately not ctx.abort() or an inbox message:
+ * Escape's meaning depends on what has focus (it aborts a running turn and restores
+ * queued messages to the editor, but cancels an open dialog and lets the turn go on),
+ * and only the key itself reproduces every case. It also works on children that were
+ * started before this verb existed, because it needs nothing from the child's extension.
+ */
+async function interruptSubagent(args: string[]): Promise<void> {
+	if (args.length !== 1) usage();
+	const metadata = getRun(args[0]);
+	if (isRemote(metadata)) {
+		process.stdout.write(runRemote(metadata.host as string, `${REMOTE_CLI} interrupt ${shq(metadata.handle)}`));
+		return;
+	}
+	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${metadata.handle} is not running (no tmux session ${metadata.tmuxSession})`);
+	const result = spawnSync("tmux", ["send-keys", "-t", metadata.tmuxSession, "Escape"], { encoding: "utf8" });
+	if (result.status !== 0) fail(`Could not send Escape to ${metadata.tmuxSession}: ${result.stderr.trim()}`);
+
+	// An aborted turn settles to idle within moments; a cancelled dialog lets the turn
+	// continue, so the child may still be busy when the bound expires.
+	const deadline = Date.now() + INTERRUPT_SETTLE_SECONDS * 1000;
+	let state = effectiveRunState(getRun(metadata.handle));
+	while ((state === "busy" || state === "starting") && Date.now() < deadline) {
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+		state = effectiveRunState(getRun(metadata.handle));
+	}
+	const note = state === "busy" ? ` (still busy after ${INTERRUPT_SETTLE_SECONDS}s)` : "";
+	process.stdout.write(`Interrupted ${runDisplayName(metadata)}\nState: ${state}${note}\n`);
+}
+
 function parseTimeout(args: string[]): number {
 	if (args.length === 0) return 1800;
 	if (args.length !== 2 || args[0] !== "--timeout") usage();
@@ -703,6 +745,9 @@ async function main(): Promise<void> {
 			break;
 		case "send":
 			sendSubagent(args);
+			break;
+		case "interrupt":
+			await interruptSubagent(args);
 			break;
 		case "wait":
 			await waitSubagent(args);

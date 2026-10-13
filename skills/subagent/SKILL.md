@@ -82,17 +82,33 @@ subagent send <handle> --follow-up "message"
 
 Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`.
 
+## Interrupt
+
+```sh
+subagent interrupt <handle>
+```
+
+`interrupt` presses Escape once in the child's pane, the same as a human who attaches and presses Escape. It waits up to 10s for the child to settle, then prints the state. Use it when a child is stuck: in a long bash command, a long `process wait`, a `question` dialog, or a runaway answer. `send` cannot unblock a child: a message to a busy child waits behind the running tool call. `stop` ends the child, and its graceful close also waits for the current turn.
+
+- Running a tool or streaming: the turn is aborted and the child goes idle. Background processes started with the `process` tool keep running. `wait` prints the aborted turn and exits 1.
+- Open dialog (`question`): only the dialog is cancelled. The tool returns "cancelled" and the turn continues, so the child may still be `busy` when `interrupt` returns. Use `wait` to follow it.
+- Idle: no effect. Do not run `interrupt` twice within half a second. Two Escapes open pi's session tree; one more `interrupt` closes it.
+
+**Queued messages are lost to the child when a turn is aborted.** A message from `send` or `send --follow-up` that is still queued when `interrupt` aborts the turn is not delivered. Pi moves it into the child's editor, and it stays there. Later `send` calls do not flush it. If the child still needs the message, `send` it again after the interrupt. Better: interrupt first, then send the new instruction. In the dialog case, the queued message is delivered when the turn continues.
+
+After an interrupt, the child takes `send` as normal.
+
 ## Stop
 
 ```sh
 subagent stop <handle> [--grace <seconds>] [--force]
 ```
 
-`stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files it created) and write a closing report, which `stop` prints. The child then exits and its tmux session, transcript, and metadata are removed. Default grace is 900s; `--force` skips the cleanup turn and tears down immediately — use it for wedged children. Stop every subagent when its work is done; keep an idle one alive only when concrete follow-up work is expected.
+`stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files it created) and write a closing report, which `stop` prints. The child then exits and its tmux session, transcript, and metadata are removed. Default grace is 900s; `--force` skips the cleanup turn and tears down immediately — use it for wedged children that `interrupt` cannot unblock. Stop every subagent when its work is done; keep an idle one alive only when concrete follow-up work is expected.
 
 ## Remote hosts
 
-A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, wait, stop, rename) is transparently forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t <host>`.
+A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, interrupt, wait, stop, rename) is transparently forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t <host>`.
 
 Hosts are configured in `~/.pi/agent/subagent.json`; read that file to see which hosts exist before spawning remotely:
 
