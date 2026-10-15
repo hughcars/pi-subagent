@@ -501,6 +501,10 @@ async function interruptSubagent(args: string[]): Promise<void> {
 		return;
 	}
 	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${metadata.handle} is not running (no tmux session ${metadata.tmuxSession})`);
+	// A pane left in copy mode (a human scrolled, then detached) takes the key itself:
+	// emacs mode-keys spend it leaving the mode, vi mode-keys keep the mode, and pi
+	// never sees it. Leave any pane mode first so the Escape reaches pi.
+	spawnSync("tmux", ["copy-mode", "-q", "-t", metadata.tmuxSession], { stdio: "ignore" });
 	const result = spawnSync("tmux", ["send-keys", "-t", metadata.tmuxSession, "Escape"], { encoding: "utf8" });
 	if (result.status !== 0) fail(`Could not send Escape to ${metadata.tmuxSession}: ${result.stderr.trim()}`);
 
