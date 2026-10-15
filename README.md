@@ -85,6 +85,8 @@ What Escape does depends on the child's state:
 
 After an interrupt, the child takes `send` as normal.
 
+`interrupt` refuses a child that `stop` is closing. Escape would move the close prompt into the editor, and the child would exit without its cleanup turn. Use `stop --force` instead.
+
 Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
 
 ## Isolation

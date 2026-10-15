@@ -501,6 +501,10 @@ async function interruptSubagent(args: string[]): Promise<void> {
 		return;
 	}
 	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${metadata.handle} is not running (no tmux session ${metadata.tmuxSession})`);
+	// During a graceful stop the close prompt waits in pi's follow-up queue. Escape would
+	// move it to the editor, and the child, already told to close, exits on the next
+	// settle without its cleanup turn while stop reports the aborted turn as the report.
+	if (metadata.closing) fail(`${metadata.handle} is being stopped; use stop --force to end it now`);
 	// A pane left in copy mode (a human scrolled, then detached) takes the key itself:
 	// emacs mode-keys spend it leaving the mode, vi mode-keys keep the mode, and pi
 	// never sees it. Leave any pane mode first so the Escape reaches pi.

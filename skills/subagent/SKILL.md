@@ -98,6 +98,8 @@ subagent interrupt <handle>
 
 After an interrupt, the child takes `send` as normal.
 
+`interrupt` refuses a child that `stop` is closing: Escape would move the close prompt into the editor, and the child would exit without its cleanup turn. Use `stop --force` instead.
+
 ## Stop
 
 ```sh
