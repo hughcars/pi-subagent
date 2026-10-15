@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -295,7 +295,36 @@ function remoteHas(host: string, command: string): boolean {
 	return spawnSync("ssh", [...SSH_OPTIONS, host, command], { stdio: "ignore" }).status === 0;
 }
 
-/** Ensure the host can run the CLI: pi, tmux, rsync, node present; extension copied and linked. */
+/** Where provisionRemote records, on the host, the content hash of the extension copy it installed. */
+const REMOTE_STAMP = "~/.pi/agent/subagent-provisioned.sha256";
+
+/** Content hash of what provisionRemote copies: the extension dir without .git, as rsync is told. */
+function shippedHash(dir: string): string {
+	const hash = createHash("sha256");
+	const walk = (rel: string): void => {
+		const entries = readdirSync(join(dir, rel), { withFileTypes: true })
+			.filter((entry) => entry.name !== ".git")
+			.map((entry) => ({ entry, path: rel ? `${rel}/${entry.name}` : entry.name }))
+			.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+		for (const { entry, path } of entries) {
+			if (entry.isDirectory()) walk(path);
+			else if (entry.isSymbolicLink()) hash.update(`link ${path}\0${readlinkSync(join(dir, path))}\0`);
+			else if (entry.isFile()) {
+				const content = readFileSync(join(dir, path));
+				hash.update(`file ${path}\0${content.length}\0`);
+				hash.update(content);
+			}
+		}
+	};
+	walk("");
+	return hash.digest("hex");
+}
+
+/**
+ * Ensure the host can run the CLI: pi, tmux, rsync, node present; extension copied and linked
+ * at the local version. The copy is redone whenever the host's stamp differs from the local
+ * content hash, so a host provisioned by an older CLI picks up new verbs on the next spawn.
+ */
 function provisionRemote(host: string): void {
 	const missing: string[] = [];
 	const checks: Array<[string, string]> = [
@@ -310,11 +339,19 @@ function provisionRemote(host: string): void {
 	if (missing.length > 0) {
 		fail(`${host} is missing remote-subagent prerequisites: ${missing.join(", ")}`);
 	}
-	if (remoteHas(host, `test -x ${REMOTE_CLI}`)) return;
 	const extensionDir = dirname(extensionPath);
+	const localHash = shippedHash(extensionDir);
+	const installed = spawnSync("ssh", [...SSH_OPTIONS, host, `test -x ${REMOTE_CLI} && cat ${REMOTE_STAMP}`], {
+		encoding: "utf8",
+	});
+	if (installed.status === 0 && installed.stdout.trim() === localHash) return;
+	// Safe while runs are in progress on the host: rsync replaces each file by rename, running
+	// children keep the code they loaded, and run metadata lives elsewhere (~/.pi/agent/subagents).
+	// The stamp is written last, so a failed copy is retried on the next spawn.
 	const copy = spawnSync("rsync", ["-a", "-e", "ssh", "--exclude", ".git", `${extensionDir}/`, `${host}:~/.pi/agent/extensions/subagent/`], { stdio: "inherit" });
 	if (copy.status !== 0) fail(`Could not copy the subagent extension to ${host}`);
 	runRemote(host, "mkdir -p ~/.pi/agent/bin && ln -sf ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent");
+	runRemote(host, `printf '%s\\n' ${localHash} > ${REMOTE_STAMP}`);
 }
 
 /** rsync a local directory to a directory on the host. Both must be directories. */
@@ -487,6 +524,21 @@ function sendSubagent(args: string[]): void {
 const INTERRUPT_SETTLE_SECONDS = 10;
 
 /**
+ * The pane pi runs in. Targeting the session would hit its active pane, which is another
+ * window if a human opened one. Runs launched before paneId was recorded fall back to the
+ * first pane of the first window, where launchRun started pi.
+ */
+function childPane(metadata: RunMetadata): string {
+	if (metadata.paneId) return metadata.paneId;
+	const panes = spawnSync("tmux", ["list-panes", "-t", `${metadata.tmuxSession}:^`, "-F", "#{pane_id}"], {
+		encoding: "utf8",
+	});
+	const first = panes.status === 0 ? panes.stdout.split("\n")[0].trim() : "";
+	if (!first) fail(`Could not find the pi pane of ${metadata.tmuxSession}: ${panes.stderr.trim()}`);
+	return first;
+}
+
+/**
  * Press Escape in the child's pane. Deliberately not ctx.abort() or an inbox message:
  * Escape's meaning depends on what has focus (it aborts a running turn and restores
  * queued messages to the editor, but cancels an open dialog and lets the turn go on),
@@ -508,9 +560,10 @@ async function interruptSubagent(args: string[]): Promise<void> {
 	// A pane left in copy mode (a human scrolled, then detached) takes the key itself:
 	// emacs mode-keys spend it leaving the mode, vi mode-keys keep the mode, and pi
 	// never sees it. Leave any pane mode first so the Escape reaches pi.
-	spawnSync("tmux", ["copy-mode", "-q", "-t", metadata.tmuxSession], { stdio: "ignore" });
-	const result = spawnSync("tmux", ["send-keys", "-t", metadata.tmuxSession, "Escape"], { encoding: "utf8" });
-	if (result.status !== 0) fail(`Could not send Escape to ${metadata.tmuxSession}: ${result.stderr.trim()}`);
+	const pane = childPane(metadata);
+	spawnSync("tmux", ["copy-mode", "-q", "-t", pane], { stdio: "ignore" });
+	const result = spawnSync("tmux", ["send-keys", "-t", pane, "Escape"], { encoding: "utf8" });
+	if (result.status !== 0) fail(`Could not send Escape to ${metadata.tmuxSession} (pane ${pane}): ${result.stderr.trim()}`);
 
 	// An aborted turn settles to idle within moments; a cancelled dialog lets the turn
 	// continue, so the child may still be busy when the bound expires.
@@ -594,8 +647,13 @@ function parseStopArgs(args: string[]): { handle: string; grace: number; force: 
 	return { handle, grace, force };
 }
 
-/** Close one running subagent: deliver the cleanup prompt, wait for its final turn. Returns the final report. */
-async function closeSubagent(metadata: RunMetadata, grace: number): Promise<string | undefined> {
+type CloseOutcome =
+	| { kind: "closed"; report?: string }
+	| { kind: "forced" }
+	| { kind: "timeout" };
+
+/** Close one running subagent: deliver the cleanup prompt, wait for its final turn and report. */
+async function closeSubagent(metadata: RunMetadata, grace: number): Promise<CloseOutcome> {
 	updateMetadata(metadata.runDir, { state: "closing", closing: true });
 	const queueDir = inboxDir(metadata.runDir);
 	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
@@ -609,13 +667,17 @@ async function closeSubagent(metadata: RunMetadata, grace: number): Promise<stri
 	const deadline = Date.now() + grace * 1000;
 	while (Date.now() < deadline) {
 		if (!tmuxSessionExists(metadata.tmuxSession)) {
+			// A concurrent stop --force marks the run before it kills the session, then removes
+			// the run dir. Either sign means the child did not exit after its cleanup turn.
+			const current = readMetadata(metadata.runDir);
+			if (!current || current.forceStopped) return { kind: "forced" };
 			// The child finished its cleanup turn and exited.
 			const message = readLatestAssistant(metadata.sessionFile);
-			return message ? assistantText(message) : undefined;
+			return { kind: "closed", report: message ? assistantText(message) : undefined };
 		}
 		await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
 	}
-	return undefined;
+	return { kind: "timeout" };
 }
 
 async function stopSubagent(args: string[]): Promise<void> {
@@ -655,9 +717,17 @@ async function stopSubagent(args: string[]): Promise<void> {
 	}
 
 	if (!force && tmuxSessionExists(metadata.tmuxSession)) {
-		const report = await closeSubagent(metadata, grace);
-		if (report !== undefined) {
-			process.stdout.write(`${handle} closed\n\n${report}\n`);
+		const outcome = await closeSubagent(metadata, grace);
+		if (outcome.kind === "forced") {
+			// The force stop owns the teardown; removing the run dir again is harmless.
+			removeRunDir(metadata.runDir);
+			process.stdout.write(
+				`${handle} was stopped by a concurrent stop --force before it finished its cleanup turn; no closing report.\n`,
+			);
+			return;
+		}
+		if (outcome.kind === "closed") {
+			process.stdout.write(`${handle} closed\n\n${outcome.report ?? "(no closing report)"}\n`);
 		} else {
 			process.stdout.write(
 				`${handle} did not finish its cleanup turn within ${grace}s; forcing teardown. Its remote work dir (if any) was left in place.\n`,
@@ -665,6 +735,8 @@ async function stopSubagent(args: string[]): Promise<void> {
 		}
 	}
 	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
+	// Tell a graceful stop that may be waiting on this child why its session is about to end.
+	if (force && wasRunning) updateMetadata(metadata.runDir, { forceStopped: true });
 	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
 	removeRunDir(metadata.runDir);

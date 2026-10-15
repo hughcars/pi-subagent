@@ -88,7 +88,7 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent interrupt <handle>
 ```
 
-`interrupt` presses Escape once in the child's pane, the same as a human who attaches and presses Escape. It waits up to 10s for the child to settle, then prints the state. Use it when a child is stuck: in a long bash command, a long `process wait`, a `question` dialog, or a runaway answer. `send` cannot unblock a child: a message to a busy child waits behind the running tool call. `stop` ends the child, and its graceful close also waits for the current turn.
+`interrupt` presses Escape once in the child's pane, the same as a human who attaches and presses Escape. The key goes to the pane pi runs in, even if someone opened another window in the child's session. It waits up to 10s for the child to settle, then prints the state. Use it when a child is stuck: in a long bash command, a long `process wait`, a `question` dialog, or a runaway answer. `send` cannot unblock a child: a message to a busy child waits behind the running tool call. `stop` ends the child, and its graceful close also waits for the current turn.
 
 - Running a tool or streaming: the turn is aborted and the child goes idle. Background processes started with the `process` tool keep running. `wait` prints the aborted turn and exits 1.
 - Open dialog (`question`): only the dialog is cancelled. The tool returns "cancelled" and the turn continues, so the child may still be `busy` when `interrupt` returns. Use `wait` to follow it.
@@ -106,7 +106,7 @@ After an interrupt, the child takes `send` as normal.
 subagent stop <handle> [--grace <seconds>] [--force]
 ```
 
-`stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files it created) and write a closing report, which `stop` prints. The child then exits and its tmux session, transcript, and metadata are removed. Default grace is 900s; `--force` skips the cleanup turn and tears down immediately — use it for wedged children that `interrupt` cannot unblock. Stop every subagent when its work is done; keep an idle one alive only when concrete follow-up work is expected.
+`stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files it created) and write a closing report, which `stop` prints. The child then exits and its tmux session, transcript, and metadata are removed. Default grace is 900s; `--force` skips the cleanup turn and tears down immediately — use it for wedged children that `interrupt` cannot unblock. A graceful `stop` that is waiting when a `stop --force` ends the child reports "stopped by a concurrent stop --force" and no closing report. Stop every subagent when its work is done; keep an idle one alive only when concrete follow-up work is expected.
 
 ## Remote hosts
 
@@ -128,7 +128,7 @@ Hosts are configured in `~/.pi/agent/subagent.json`; read that file to see which
 }
 ```
 
-The ssh alias must work non-interactively (BatchMode) and carries the transport — an SSM ProxyCommand entry is fine. The host needs `pi`, `tmux`, `rsync`, and node >= 22.19; the subagent extension itself is copied over and linked automatically on first use.
+The ssh alias must work non-interactively (BatchMode) and carries the transport — an SSM ProxyCommand entry is fine. The host needs `pi`, `tmux`, `rsync`, and node >= 22.19; the subagent extension itself is copied over and linked automatically on first use, and copied again on any spawn where the host's copy differs from the local version (content hash recorded in `~/.pi/agent/subagent-provisioned.sha256` on the host). Runs already in progress on the host keep running.
 
 A host entry's `provider`/`model`/`thinking` are the defaults when spawn passes no explicit `--provider`/`--model`/`--thinking`; without them the local session's ambient model would be forwarded and may not exist on the host. When a configured host declares a model, spawning needs nothing more than `--host`:
 

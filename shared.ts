@@ -58,6 +58,12 @@ export interface RunMetadata {
 	/** Local directory that was synced to remoteCwd at spawn time. */
 	syncSource?: string;
 	tmuxSession: string;
+	/**
+	 * tmux pane id (`%N`) of the pane pi runs in, recorded by launchRun. Keys meant for pi go
+	 * here and not to the session, whose active pane can be another window a human opened.
+	 * Absent for runs launched before it was recorded.
+	 */
+	paneId?: string;
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -70,6 +76,8 @@ export interface RunMetadata {
 	suspended?: boolean;
 	/** Set when a supervisor close was delivered; the child exits after its final cleanup turn. */
 	closing?: boolean;
+	/** Set by `stop --force` before it kills the session, so a graceful stop in progress can tell why the child went away. */
+	forceStopped?: boolean;
 	state: RunState;
 	hasStarted: boolean;
 	createdAt: string;
@@ -219,7 +227,10 @@ export function tmuxSessionExists(session: string): boolean {
 	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
 }
 
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
+/**
+ * Start the child pi process for a run in its tmux session and record its pane id in the
+ * metadata. `initialArgs` are only passed on first spawn.
+ */
 export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
@@ -235,6 +246,9 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		[
 			"new-session",
 			"-d",
+			"-P",
+			"-F",
+			"#{pane_id}",
 			"-s",
 			metadata.tmuxSession,
 			"-x",
@@ -261,6 +275,11 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		{ encoding: "utf8" },
 	);
 	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
+	// The child writes its metadata first in session_start, after pi has loaded, so this
+	// write lands before it. Relaunches record their new pane the same way; if tmux printed
+	// no pane id, the stale one is cleared so interrupt falls back to the first pane.
+	const paneId = result.stdout.trim();
+	updateMetadata(metadata.runDir, { paneId: /^%\d+$/.test(paneId) ? paneId : undefined });
 }
 
 export function isRemote(metadata: RunMetadata): boolean {

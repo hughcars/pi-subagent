@@ -71,7 +71,7 @@ subagent list
 
 ### Interrupt
 
-`subagent interrupt <handle>` presses Escape once in the child's tmux pane (`tmux send-keys Escape`), the same as attaching and pressing Escape by hand. It then waits up to 10 seconds for the child to settle and prints its state. Use it to unblock a stuck child. `send` cannot do this, because a message to a busy child waits behind the running tool call. `stop` cannot do it either: it ends the child, and its graceful close also waits for the current turn.
+`subagent interrupt <handle>` presses Escape once in the child's tmux pane (`tmux send-keys Escape`), the same as attaching and pressing Escape by hand. The key goes to the pane pi runs in, even if someone opened another window in the child's session. It then waits up to 10 seconds for the child to settle and prints its state. Use it to unblock a stuck child. `send` cannot do this, because a message to a busy child waits behind the running tool call. `stop` cannot do it either: it ends the child, and its graceful close also waits for the current turn.
 
 What Escape does depends on the child's state:
 
@@ -118,13 +118,13 @@ A subagent can run on another machine over ssh. The working directory is rsynced
 }
 ```
 
-The ssh alias must work non-interactively (BatchMode) and carries the transport — an SSM ProxyCommand entry is fine. The host needs `pi`, `tmux`, `rsync`, and node >= 22.19; the extension copies itself over and links the CLI automatically on first use. A host's `provider`/`model`/`thinking` are the spawn defaults when no explicit flags are passed, so `subagent spawn --host <alias> --name work --prompt ...` is all it takes.
+The ssh alias must work non-interactively (BatchMode) and carries the transport — an SSM ProxyCommand entry is fine. The host needs `pi`, `tmux`, `rsync`, and node >= 22.19; the extension copies itself over and links the CLI automatically on first use. Each spawn compares a content hash of the local extension with the one recorded on the host (`~/.pi/agent/subagent-provisioned.sha256`) and copies the extension again when they differ, so a host always runs the spawning CLI's version. Runs already in progress on the host keep running. A host's `provider`/`model`/`thinking` are the spawn defaults when no explicit flags are passed, so `subagent spawn --host <alias> --name work --prompt ...` is all it takes.
 
 `subagent fetch <handle> [dest]` rsyncs results back explicitly — nothing syncs back on its own. On a host with an AWS instance profile, the child's credentials never expire: Bedrock Converse signs via the ambient IMDS chain.
 
 `subagent hosts` lists the configured registry with live reachability and active run counts, so callers can discover usable hosts before spawning. Creating new compute is not this tool's job — discover first, provision only when nothing is usable.
 
-`subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, transcript, metadata, and — for remote runs — the synced work directory. Default grace is 900 seconds; `--force` tears down immediately. Children never terminate on a timer: only a supervisor's close ends them.
+`subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, transcript, metadata, and — for remote runs — the synced work directory. Default grace is 900 seconds; `--force` tears down immediately. If a `stop --force` ends the child while a graceful `stop` waits for it, the graceful `stop` says so and prints no report. Children never terminate on a timer: only a supervisor's close ends them.
 
 ## License
 
