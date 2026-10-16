@@ -4,6 +4,8 @@ Observable, persistent Pi subagents for independent reviews, investigations, and
 
 Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
 
+When a child turn settles, the extension automatically sends its dispatching parent a `subagent-state` message. An idle parent starts a turn immediately; while the parent is busy, the durable settlement stays unacknowledged until the parent becomes idle, so aborting the active turn cannot discard a queued notification. After an aborted or failed parent turn the ping is displayed without restarting work; the next user turn can act on it. The notification tells the parent to retrieve the durable result with `subagent wait` and continue the delegated work. A `wait` run by the dispatching Pi session acknowledges the result itself and avoids a redundant wake-up; a wait from another shell cannot silence the parent. Delivery is acknowledged in run metadata, so reloads do not replay a notification; remote completions are delivered after the next state refresh. One-shot print and JSON sessions leave notifications pending for a later persistent session. Deliberate `subagent stop` cleanup turns are excluded because `stop` returns their report directly.
+
 ## Requirements
 
 - Pi
@@ -68,6 +70,8 @@ subagent wait a1b2c3
 subagent stop a1b2c3
 subagent list
 ```
+
+`wait` is still useful when the result is required synchronously in the current turn. Do not start a separate polling loop merely to notice completion: the automatic state message wakes the parent after every settled child turn.
 
 ### Interrupt
 

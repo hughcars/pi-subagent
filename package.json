@@ -10,6 +10,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"

@@ -80,6 +80,10 @@ export interface RunMetadata {
 	forceStopped?: boolean;
 	state: RunState;
 	hasStarted: boolean;
+	/** Written by the child whenever one agent turn fully settles. */
+	settledAt?: string;
+	/** Latest settledAt token delivered to this run's dispatching parent session. */
+	parentNotifiedSettledAt?: string;
 	createdAt: string;
 	updatedAt: string;
 	error?: string;
@@ -296,6 +300,44 @@ export function effectiveRunState(metadata: RunMetadata): RunState {
 		return "exited";
 	}
 	return metadata.state;
+}
+
+/**
+ * A durable child supplies settledAt. previousState is only a compatibility fallback for a
+ * child loaded before settledAt existed; observing an already-idle legacy child is not an event.
+ */
+export function pendingSettlementToken(
+	metadata: RunMetadata,
+	previousState: RunState | undefined,
+	currentState: RunState,
+): string | undefined {
+	if (!metadata.hasStarted) return undefined;
+	const legacySettled =
+		!metadata.settledAt && previousState !== undefined && previousState !== "idle" && currentState === "idle";
+	const token = metadata.settledAt ?? (legacySettled ? `legacy:${metadata.updatedAt}` : undefined);
+	return token && metadata.parentNotifiedSettledAt !== token ? token : undefined;
+}
+
+export type SettlementDelivery = "trigger" | "display";
+
+/** Retry cancellation and terminal model errors also express "do not immediately restart this run". */
+export function parentRunWasInterrupted(aborted: boolean, stopReason: string | undefined): boolean {
+	return aborted || stopReason === "aborted" || stopReason === "error";
+}
+
+/** A one-shot mode cannot service an unsolicited turn; an abort permits display but not restart. */
+export function settlementDelivery(
+	parentMode: string,
+	parentIdle: boolean,
+	parentRunAborted: boolean,
+): SettlementDelivery | undefined {
+	if (parentMode === "print" || parentMode === "json" || !parentIdle) return undefined;
+	return parentRunAborted ? "display" : "trigger";
+}
+
+/** Only the Pi session that dispatched a run may consume its automatic parent notification. */
+export function isDispatchingSession(metadata: RunMetadata, sessionId = process.env.PI_SESSION_ID): boolean {
+	return typeof sessionId === "string" && sessionId.length > 0 && sessionId === metadata.parentSessionId;
 }
 
 export const SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];

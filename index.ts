@@ -10,12 +10,16 @@ import {
 	isRemote,
 	launchRun,
 	listRuns,
+	parentRunWasInterrupted,
+	pendingSettlementToken,
 	readMetadata,
 	REMOTE_CLI,
 	removeRunDir,
 	runDisplayName,
+	settlementDelivery,
 	type InboxMessage,
 	type RunMetadata,
+	type RunState,
 	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
@@ -34,6 +38,15 @@ function isInboxMessage(value: unknown): value is InboxMessage {
 
 function displayState(metadata: RunMetadata): string {
 	return effectiveRunState(metadata).padEnd(8);
+}
+
+function latestAssistantStopReason(ctx: ExtensionContext): string | undefined {
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "message" && entry.message.role === "assistant") return entry.message.stopReason;
+	}
+	return undefined;
 }
 
 export default function subagentExtension(pi: ExtensionAPI) {
@@ -145,8 +158,61 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	if (!runDir) {
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
 		let widgetContext: ExtensionContext | undefined;
+		const observedStates = new Map<string, RunState>();
 		const REMOTE_POLL_MS = 20000;
 		let remoteRefreshBusy = false;
+		let parentRunAborted = false;
+
+		const notifySettledRuns = (): void => {
+			if (!widgetContext) return;
+			for (const run of listRuns(widgetContext.sessionManager.getSessionId())) {
+				const state = effectiveRunState(run);
+				const previousState = observedStates.get(run.handle);
+				const token = pendingSettlementToken(run, previousState, state);
+				if (!token) {
+					observedStates.set(run.handle, state);
+					continue;
+				}
+
+				// stop prints the cleanup result synchronously. Do not also wake the parent for
+				// that deliberately closing turn, but acknowledge it so reload cannot replay it.
+				if (run.closing) {
+					updateMetadata(run.runDir, { parentNotifiedSettledAt: token });
+					observedStates.set(run.handle, state);
+					continue;
+				}
+
+				// A queued message can be discarded with the active parent turn. One-shot modes
+				// cannot service unsolicited turns; after Escape, show the ping without undoing
+				// the user's abort. In every deferred case the durable token remains pending.
+				const delivery = settlementDelivery(widgetContext.mode, widgetContext.isIdle(), parentRunAborted);
+				if (!delivery) continue;
+
+				const displayName = runDisplayName(run);
+				try {
+					pi.sendMessage(
+						{
+							customType: "subagent-state",
+							content:
+								`Subagent ${displayName} finished a turn and is currently ${state}. ` +
+								`Run \`subagent wait ${run.handle}\` now to retrieve its result and continue the delegated work.`,
+							display: true,
+							details: { handle: run.handle, name: run.name, state, settledAt: run.settledAt },
+						},
+						{ triggerTurn: delivery === "trigger" },
+					);
+					updateMetadata(run.runDir, { parentNotifiedSettledAt: token });
+					observedStates.set(run.handle, state);
+				} catch (error) {
+					if (widgetContext.hasUI) {
+						widgetContext.ui.notify(
+							`Could not deliver completion from ${displayName}: ${error instanceof Error ? error.message : String(error)}`,
+							"error",
+						);
+					}
+				}
+			}
+		};
 
 		// Remote runs live in the host's tmux server; poll their real states over ssh so the
 		// widget and picker stay truthful. Runs stopped on the host side are dropped here.
@@ -188,8 +254,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 								if (match) {
 									updateMetadata(run.runDir, {
 										state: match.state,
-									error: match.error,
-									hasStarted: match.hasStarted,
+										error: match.error,
+										hasStarted: match.hasStarted,
+										settledAt: match.settledAt,
 									});
 								} else {
 									removeRunDir(run.runDir);
@@ -205,7 +272,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			};
 
 		const refreshWidget = (): void => {
-			if (!widgetContext) return;
+			if (!widgetContext?.hasUI) return;
 			const activeRuns = listRuns(widgetContext.sessionManager.getSessionId())
 				.map((run) => ({ run, state: effectiveRunState(run) }))
 				.filter(({ state }) => state !== "exited");
@@ -256,22 +323,36 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			if (!ctx.hasUI) return;
+			// State monitoring is functional behavior, not UI behavior. One-shot print/JSON
+			// sessions leave settlements pending; TUI/RPC delivery begins on the first timer tick.
 			widgetContext = ctx;
+			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
+				observedStates.set(run.handle, effectiveRunState(run));
+			}
 			refreshWidget();
 			refreshRemoteStates();
 			widgetTimer = setInterval(() => {
+				notifySettledRuns();
 				refreshWidget();
 				if (Date.now() % REMOTE_POLL_MS < 1000) refreshRemoteStates();
 			}, 1000);
 			widgetTimer.unref();
 		});
 
+		pi.on("agent_start", () => {
+			parentRunAborted = false;
+		});
+
+		pi.on("agent_settled", (event, ctx) => {
+			parentRunAborted = parentRunWasInterrupted(event.aborted, latestAssistantStopReason(ctx));
+		});
+
 		pi.on("session_shutdown", async (event, ctx) => {
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = undefined;
 			widgetContext = undefined;
-			ctx.ui.setWidget("subagents", undefined);
+			observedStates.clear();
+			if (ctx.hasUI) ctx.ui.setWidget("subagents", undefined);
 			if (event.reason === "reload") return;
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
@@ -387,7 +468,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", (_event, ctx) => {
 		currentContext = ctx;
-		if (ctx.isIdle()) updateMetadata(runDir, { state: "idle" });
+		if (ctx.isIdle()) updateMetadata(runDir, { state: "idle", settledAt: new Date().toISOString() });
 		// The supervisor closed this run and its final cleanup turn has settled:
 		// the child has nothing left to do. The session file is append-durable, so
 		// exiting here ends the tmux session and lets stop's teardown complete.

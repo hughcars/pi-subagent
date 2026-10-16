@@ -14,6 +14,7 @@ import {
 	getAgentDir,
 	getRunsDir,
 	inboxDir,
+	isDispatchingSession,
 	isRemote,
 	launchRun,
 	loadHosts,
@@ -459,7 +460,12 @@ function statusSubagent(args: string[]): void {
 		const remoteMeta = JSON.parse(
 			runRemote(metadata.host as string, `${REMOTE_CLI} status ${shq(metadata.handle)} --json`),
 		) as RunMetadata;
-		updateMetadata(metadata.runDir, { state: remoteMeta.state, error: remoteMeta.error, hasStarted: remoteMeta.hasStarted });
+		updateMetadata(metadata.runDir, {
+			state: remoteMeta.state,
+			error: remoteMeta.error,
+			hasStarted: remoteMeta.hasStarted,
+			settledAt: remoteMeta.settledAt,
+		});
 	}
 	const current = readMetadata(metadata.runDir) ?? metadata;
 	if (asJson) {
@@ -593,9 +599,15 @@ async function waitSubagent(args: string[]): Promise<void> {
 
 	const initial = getRun(handle);
 	if (isRemote(initial)) {
+		const dispatchingSession = isDispatchingSession(initial);
+		const parentEnv = dispatchingSession ? `PI_SESSION_ID=${shq(process.env.PI_SESSION_ID as string)} ` : "";
 		const result = spawnSync(
 			"ssh",
-			[...SSH_OPTIONS, initial.host as string, `${REMOTE_CLI} wait ${shq(handle)} --timeout ${timeoutSeconds}`],
+			[
+				...SSH_OPTIONS,
+				initial.host as string,
+				`${parentEnv}${REMOTE_CLI} wait ${shq(handle)} --timeout ${timeoutSeconds}`,
+			],
 			{ stdio: "inherit" },
 		);
 		process.exitCode = result.status ?? 1;
@@ -603,7 +615,21 @@ async function waitSubagent(args: string[]): Promise<void> {
 			const remoteMeta = JSON.parse(
 				runRemote(initial.host as string, `${REMOTE_CLI} status ${shq(handle)} --json`),
 			) as RunMetadata;
-			updateMetadata(initial.runDir, { state: remoteMeta.state, error: remoteMeta.error });
+			const patch: Partial<RunMetadata> = {
+				state: remoteMeta.state,
+				error: remoteMeta.error,
+				settledAt: remoteMeta.settledAt,
+			};
+			// The remote wait marks the token only after it consumed the result. Omitting the
+			// field otherwise preserves a concurrent acknowledgement in the local shadow.
+			if (
+				dispatchingSession &&
+				remoteMeta.settledAt &&
+				remoteMeta.parentNotifiedSettledAt === remoteMeta.settledAt
+			) {
+				patch.parentNotifiedSettledAt = remoteMeta.settledAt;
+			}
+			updateMetadata(initial.runDir, patch);
 		} catch (error) {
 			if (/Unknown subagent/.test(String(error))) removeRunDir(initial.runDir);
 		}
@@ -621,6 +647,9 @@ async function waitSubagent(args: string[]): Promise<void> {
 		if (metadata.hasStarted && state === "idle" && !pending) {
 			const message = readLatestAssistant(metadata.sessionFile);
 			if (!message) fail(`${handle} finished without an assistant response`);
+			if (metadata.settledAt && isDispatchingSession(metadata)) {
+				updateMetadata(metadata.runDir, { parentNotifiedSettledAt: metadata.settledAt });
+			}
 			process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
 			if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
 			return;
