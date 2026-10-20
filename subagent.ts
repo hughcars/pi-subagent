@@ -676,6 +676,16 @@ function parseStopArgs(args: string[]): { handle: string; grace: number; force: 
 	return { handle, grace, force };
 }
 
+// A remote parent sets this variable on its ssh stop call. The host's stop then prints its outcome on a
+// fixed first line, so the parent can remove the synced work dir only after a clean close. Older CLIs
+// ignore the variable and print no line, and the parent then keeps the work dir.
+const STOP_OUTCOME_ENV = "PI_SUBAGENT_STOP_OUTCOME";
+const STOP_OUTCOME_PREFIX = "subagent-stop-outcome: ";
+
+function reportStopOutcome(outcome: "closed" | "timeout" | "forced" | "stopped"): void {
+	if (process.env[STOP_OUTCOME_ENV] === "1") process.stdout.write(`${STOP_OUTCOME_PREFIX}${outcome}\n`);
+}
+
 type CloseOutcome =
 	| { kind: "closed"; report?: string }
 	| { kind: "forced" }
@@ -715,7 +725,7 @@ async function stopSubagent(args: string[]): Promise<void> {
 	if (isRemote(metadata)) {
 		// The synced work tree is the parent's responsibility: it was the parent that
 		// put it there. Validate (and clean) only trees the parent placed under the host's root.
-		let removeWorkdir: (() => void) | undefined;
+		let workdir: string | undefined;
 		if (!force) {
 			const hosts = loadHosts();
 			const config = hosts[metadata.host as string];
@@ -731,22 +741,29 @@ async function stopSubagent(args: string[]): Promise<void> {
 				if (remoteCwd === root || !remoteCwd.startsWith(`${root}/`)) {
 						fail(`Refusing to clean remote work dir ${remoteCwd}: not under ${root}`);
 				}
-				const workdir = remoteCwd;
-				removeWorkdir = () => runRemote(metadata.host as string, `rm -rf ${shq(workdir)}`);
+				workdir = remoteCwd;
 			}
 		}
-		const remoteArgs = [REMOTE_CLI, "stop", shq(metadata.handle)];
+		const remoteArgs = [`${STOP_OUTCOME_ENV}=1`, REMOTE_CLI, "stop", shq(metadata.handle)];
 		if (force) remoteArgs.push("--force");
 		else remoteArgs.push("--grace", String(grace));
 		const remoteOutput = runRemote(metadata.host as string, remoteArgs.join(" "));
-		if (removeWorkdir) removeWorkdir();
+		const outcomeLine = remoteOutput.startsWith(STOP_OUTCOME_PREFIX)
+			? remoteOutput.slice(0, remoteOutput.indexOf("\n") + 1)
+			: "";
+		// Remove the work dir only after the child's cleanup turn. A grace timeout, a concurrent
+		// stop --force, a child that had already exited, and an older remote CLI all keep it.
+		const closed = outcomeLine === `${STOP_OUTCOME_PREFIX}closed\n`;
+		if (workdir && closed) runRemote(metadata.host as string, `rm -rf ${shq(workdir)}`);
 		removeRunDir(metadata.runDir);
-		process.stdout.write(remoteOutput);
+		process.stdout.write(remoteOutput.slice(outcomeLine.length));
+		if (workdir && !closed) process.stdout.write(`Remote work dir ${workdir} on ${metadata.host} was left in place.\n`);
 		return;
 	}
 
 	if (!force && tmuxSessionExists(metadata.tmuxSession)) {
 		const outcome = await closeSubagent(metadata, grace);
+		reportStopOutcome(outcome.kind);
 		if (outcome.kind === "forced") {
 			// The force stop owns the teardown; removing the run dir again is harmless.
 			removeRunDir(metadata.runDir);
@@ -762,7 +779,7 @@ async function stopSubagent(args: string[]): Promise<void> {
 				`${handle} did not finish its cleanup turn within ${grace}s; forcing teardown. Its remote work dir (if any) was left in place.\n`,
 			);
 		}
-	}
+	} else reportStopOutcome("stopped");
 	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
 	// Tell a graceful stop that may be waiting on this child why its session is about to end.
 	if (force && wasRunning) updateMetadata(metadata.runDir, { forceStopped: true });

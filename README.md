@@ -128,7 +128,7 @@ The ssh alias must work non-interactively (BatchMode) and carries the transport 
 
 `subagent hosts` lists the configured registry with live reachability and active run counts, so callers can discover usable hosts before spawning. Creating new compute is not this tool's job — discover first, provision only when nothing is usable.
 
-`subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, transcript, metadata, and — for remote runs — the synced work directory. Default grace is 900 seconds; `--force` tears down immediately. If a `stop --force` ends the child while a graceful `stop` waits for it, the graceful `stop` says so and prints no report. Children never terminate on a timer: only a supervisor's close ends them.
+`subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, transcript, metadata, and — for remote runs — the synced work directory. The work directory is removed only when the child closed after its cleanup turn; otherwise it stays on the host, and a graceful `stop` prints its path. Default grace is 900 seconds; `--force` tears down immediately. If a `stop --force` ends the child while a graceful `stop` waits for it, the graceful `stop` says so and prints no report. Children never terminate on a timer: only a supervisor's close ends them.
 
 ## License
 
