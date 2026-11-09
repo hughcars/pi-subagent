@@ -799,7 +799,7 @@ async function stopSubagent(args: string[]): Promise<void> {
 	else if (metadata.discardTranscript === true) {
 		const allocated = metadata.allocatedSessionFile;
 		process.stdout.write(allocated && !existsSync(allocated) ? "Transcript deleted.\n" : `Transcript not deleted: ${allocated ?? metadata.sessionFile}\n`);
-		if (metadata.sessionFile !== allocated && existsSync(metadata.sessionFile)) {
+		if (allocated && metadata.sessionFile !== allocated && existsSync(metadata.sessionFile)) {
 			process.stdout.write(`The run switched to ${metadata.sessionFile}, which was left in place.\n`);
 		}
 	}
