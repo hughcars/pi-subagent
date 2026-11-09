@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -377,7 +377,10 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 	const model = options.modelExplicit || !config.model ? options.model : config.model;
 	const thinking = options.thinkingExplicit || !config.thinking ? options.thinking : config.thinking;
 
-	const srcDir = resolve(options.cwd);
+	// Canonical paths, so that --file arguments are recognised as inside --cwd whatever symlinks
+	// either path goes through (on macOS, /tmp is a symlink to /private/tmp).
+	if (!existsSync(options.cwd)) fail(`No such directory: ${options.cwd}`);
+	const srcDir = realpathSync(resolve(options.cwd));
 	const remoteHome = runRemote(host, "echo $HOME").trim();
 	const expandRemote = (path: string): string =>
 		path === "~" ? remoteHome : path.startsWith("~/") ? `${remoteHome}/${path.slice(2)}` : path;
@@ -393,13 +396,15 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 	// relative location, anything else is copied into <remoteBase>/.subagent-files/.
 	const remoteFiles: string[] = [];
 	for (const file of options.files) {
-		const resolvedFile = resolve(file);
+		if (!existsSync(file)) fail(`No such file: ${file}`);
+		const resolvedFile = realpathSync(resolve(file));
 		const rel = relative(srcDir, resolvedFile);
 		if (rel && !rel.startsWith("..")) {
 			remoteFiles.push(`${remoteBase}/${rel}`);
 			continue;
 		}
 		const target = `${remoteBase}/.subagent-files/${basename(resolvedFile)}`;
+		runRemote(host, `mkdir -p ${shq(dirname(target))}`);
 		const copy = spawnSync("rsync", ["-a", "-e", "ssh", resolvedFile, `${host}:${target}`], { stdio: "ignore" });
 		if (copy.status !== 0) fail(`Could not copy ${resolvedFile} to ${host}`);
 		remoteFiles.push(target);
