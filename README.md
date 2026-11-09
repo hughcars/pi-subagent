@@ -102,8 +102,13 @@ Optional spawn flags:
 - `--no-skills`: disable skills
 - `--no-prompt-templates`: disable prompt templates
 - `--no-context-files`: ignore repository instruction files
+- `--discard-transcript`: delete the transcript at `stop` instead of keeping it
 
-Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes the run's control state permanently.
+
+## Transcripts
+
+Each run's transcript has a private, stable path under `<session-root>/subagents/`, where session-root is `PI_CODING_AGENT_SESSION_DIR` or `<agent-dir>/sessions`. Spawn prints it. When a run is torn down, by `stop` or by its parent discarding a child that exited on its own, a non-empty transcript is kept there unless the run was spawned with `--discard-transcript`, which deletes the file spawn allocated; `stop` prints which, and says so if the child had switched to another session file, which is left in place. Empty files from a launch that wrote nothing are removed. A run spawned before transcripts moved out of the run directory has its transcript linked into session storage before that directory is removed, and a failure to do so leaves both the transcript and the control state in place. Kept transcripts are not active runs and `subagent list` does not show them. A remote run's transcript follows the same rule on its execution host; nothing is copied back.
 
 ## Remote hosts
 
@@ -128,7 +133,7 @@ The ssh alias must work non-interactively (BatchMode) and carries the transport 
 
 `subagent hosts` lists the configured registry with live reachability and active run counts, so callers can discover usable hosts before spawning. Creating new compute is not this tool's job — discover first, provision only when nothing is usable.
 
-`subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, transcript, metadata, and — for remote runs — the synced work directory. The work directory is removed only when the child closed after its cleanup turn; otherwise it stays on the host, and a graceful `stop` prints its path. Default grace is 900 seconds; `--force` tears down immediately. If a `stop --force` ends the child while a graceful `stop` waits for it, the graceful `stop` says so and prints no report. Children never terminate on a timer: only a supervisor's close ends them.
+`subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, control metadata, the transcript if the run was spawned with `--discard-transcript`, and — for remote runs — the synced work directory. The work directory is removed only when the child closed after its cleanup turn; otherwise it stays on the host, and a graceful `stop` prints its path. Default grace is 900 seconds; `--force` tears down immediately. If a `stop --force` ends the child while a graceful `stop` waits for it, the graceful `stop` says so and prints no report. Children never terminate on a timer: only a supervisor's close ends them.
 
 ## License
 
