@@ -187,6 +187,12 @@ test("a run spawned to discard its transcript deletes only its own archived file
 	assert.equal(removeRunDir(f.runDir), undefined);
 	assert.equal(existsSync(allocated), false);
 	assert.equal(readFileSync(lookalike, "utf8"), transcript);
+	// Nor does a missing current file keep the allocated one.
+	const kept = createSessionFile("abc123");
+	writeFileSync(kept, transcript);
+	writeMetadata({ ...f.metadata, sessionFile: join(f.root, "gone.jsonl"), allocatedSessionFile: kept, discardTranscript: true });
+	assert.equal(removeRunDir(f.runDir), undefined);
+	assert.equal(existsSync(kept), false);
 });
 
 test("discarding unlinks the run's own path, not a linked target, whatever session root is set now", t => {

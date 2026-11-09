@@ -797,11 +797,11 @@ async function stopSubagent(args: string[]): Promise<void> {
 	if (force || !wasRunning) process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
 	if (kept) process.stdout.write(`Transcript kept: ${kept}\n`);
 	else if (metadata.discardTranscript === true) {
-		process.stdout.write(
-			existsSync(metadata.sessionFile)
-				? `Transcript not deleted: the run switched to ${metadata.sessionFile}, which spawn did not allocate.\n`
-				: "Transcript deleted.\n",
-		);
+		const allocated = metadata.allocatedSessionFile;
+		process.stdout.write(allocated && !existsSync(allocated) ? "Transcript deleted.\n" : `Transcript not deleted: ${allocated ?? metadata.sessionFile}\n`);
+		if (metadata.sessionFile !== allocated && existsSync(metadata.sessionFile)) {
+			process.stdout.write(`The run switched to ${metadata.sessionFile}, which was left in place.\n`);
+		}
 	}
 }
 

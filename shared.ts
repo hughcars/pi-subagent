@@ -315,7 +315,14 @@ export function removeRunDir(runDir: string): string | undefined {
 		throw new Error(`Refusing to delete ${runDir}: run metadata is missing or unreadable`);
 	}
 	let retained: string | undefined;
-	if (!isRemote(metadata) && existsSync(metadata.sessionFile)) {
+	if (isRemote(metadata)) {
+		// The host owns a remote run's transcript.
+	} else if (metadata.discardTranscript === true) {
+		// Only the file allocated for this run is deleted, whatever session root is configured now
+		// and whichever file the child last reported; unlinking its own path never follows a link
+		// to another run's transcript. A file the child switched to stays, and stop reports it.
+		if (metadata.allocatedSessionFile) rmSync(metadata.allocatedSessionFile, { force: true });
+	} else if (existsSync(metadata.sessionFile)) {
 		let file: string;
 		let source: ReturnType<typeof statSync>;
 		try {
@@ -327,12 +334,7 @@ export function removeRunDir(runDir: string): string | undefined {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(runDir)) return undefined;
 			throw error;
 		}
-		if (metadata.discardTranscript === true) {
-			// Only the file allocated for this run is deleted, whatever session root is configured
-			// now; unlinking its own path never follows a link to another run's transcript. A file
-			// the child switched to stays, and stop reports it.
-			if (metadata.allocatedSessionFile) rmSync(metadata.allocatedSessionFile, { force: true });
-		} else if (source.size === 0) {
+		if (source.size === 0) {
 			// A launch that never wrote a session has no evidence to keep.
 			if (inside(realpathSync(sessionArchiveDir()), file)) rmSync(file, { force: true });
 		} else {
