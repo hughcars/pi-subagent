@@ -75,6 +75,11 @@ export interface RunMetadata {
 	sessionFile: string;
 	/** Set at spawn when the transcript is deleted at teardown instead of kept for later reading. */
 	discardTranscript?: boolean;
+	/**
+	 * The transcript path createRun allocated. The child repoints sessionFile to whatever file Pi
+	 * reports, so only this path, never repointed, authorises deleting a discarded transcript.
+	 */
+	allocatedSessionFile?: string;
 	cwd: string;
 	provider: string;
 	model: string;
@@ -273,7 +278,7 @@ export function createRun(setup: RunSetup): RunMetadata {
 		sessionFile = createSessionFile(setup.handle);
 		const now = new Date().toISOString();
 		const metadata: RunMetadata = {
-			...setup, version: 1, runDir, sessionFile, tmuxSession: `pi-subagent-${setup.handle}`,
+			...setup, version: 1, runDir, sessionFile, allocatedSessionFile: sessionFile, tmuxSession: `pi-subagent-${setup.handle}`,
 			state: "starting", hasStarted: false, createdAt: now, updatedAt: now,
 		};
 		writeMetadata(metadata);
@@ -287,14 +292,6 @@ export function createRun(setup: RunSetup): RunMetadata {
 		}
 		throw error;
 	}
-}
-
-const ALLOCATED_SESSION_SUFFIX = /^-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/;
-
-/** Whether the run's transcript is the file createSessionFile named for it. */
-function ownsSessionFile(metadata: RunMetadata): boolean {
-	const name = basename(metadata.sessionFile);
-	return name.startsWith(metadata.handle) && ALLOCATED_SESSION_SUFFIX.test(name.slice(metadata.handle.length));
 }
 
 function syncPath(path: string): void {
@@ -330,12 +327,14 @@ export function removeRunDir(runDir: string): string | undefined {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(runDir)) return undefined;
 			throw error;
 		}
-		if (source.size === 0 || metadata.discardTranscript === true) {
-			// An empty transcript is a launch that never wrote a session. A discarded one inside the
-			// run dir goes with it. Otherwise only the file createSessionFile allocated for this run is
-			// deleted, by its own name, whatever session root is configured now; unlinking that path
-			// never follows a link to another run's transcript.
-			if (ownsSessionFile(metadata)) rmSync(metadata.sessionFile, { force: true });
+		if (metadata.discardTranscript === true) {
+			// Only the file allocated for this run is deleted, whatever session root is configured
+			// now; unlinking its own path never follows a link to another run's transcript. A file
+			// the child switched to stays, and stop reports it.
+			if (metadata.allocatedSessionFile) rmSync(metadata.allocatedSessionFile, { force: true });
+		} else if (source.size === 0) {
+			// A launch that never wrote a session has no evidence to keep.
+			if (inside(realpathSync(sessionArchiveDir()), file)) rmSync(file, { force: true });
 		} else {
 			retained = file;
 			if (inside(control, file)) {

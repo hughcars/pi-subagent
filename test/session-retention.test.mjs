@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import test from "node:test";
 import { createRun, createSessionFile, readLatestAssistant, readMetadata, removeRunDir, writeMetadata } from "../shared.ts";
 
@@ -174,16 +174,19 @@ test("a run spawned to discard its transcript deletes only its own archived file
 	const f = fixture(t);
 	const sessionFile = createSessionFile("abc123");
 	writeFileSync(sessionFile, transcript);
-	writeMetadata({ ...f.metadata, sessionFile, discardTranscript: true });
+	writeMetadata({ ...f.metadata, sessionFile, allocatedSessionFile: sessionFile, discardTranscript: true });
 	assert.equal(removeRunDir(f.runDir), undefined);
 	assert.equal(existsSync(sessionFile), false);
 	assert.equal(existsSync(f.runDir), false);
-	// A path outside session storage is never deleted on the run's behalf.
-	const external = join(f.root, "elsewhere.jsonl");
-	writeFileSync(external, transcript);
-	writeMetadata({ ...f.metadata, sessionFile: external, discardTranscript: true });
+	// A file the child repointed sessionFile to is not the run's to delete, even with a lookalike name.
+	const allocated = createSessionFile("abc123");
+	writeFileSync(allocated, transcript);
+	const lookalike = join(f.root, basename(allocated));
+	writeFileSync(lookalike, transcript);
+	writeMetadata({ ...f.metadata, sessionFile: lookalike, allocatedSessionFile: allocated, discardTranscript: true });
 	assert.equal(removeRunDir(f.runDir), undefined);
-	assert.equal(readFileSync(external, "utf8"), transcript);
+	assert.equal(existsSync(allocated), false);
+	assert.equal(readFileSync(lookalike, "utf8"), transcript);
 });
 
 test("discarding unlinks the run's own path, not a linked target, whatever session root is set now", t => {
@@ -193,14 +196,14 @@ test("discarding unlinks the run's own path, not a linked target, whatever sessi
 	const sessionFile = createSessionFile("abc123");
 	rmSync(sessionFile);
 	fs.symlinkSync(other, sessionFile);
-	writeMetadata({ ...f.metadata, sessionFile, discardTranscript: true });
+	writeMetadata({ ...f.metadata, sessionFile, allocatedSessionFile: sessionFile, discardTranscript: true });
 	removeRunDir(f.runDir);
 	assert.equal(fs.existsSync(sessionFile) || fs.lstatSync(sessionFile, { throwIfNoEntry: false }) !== undefined, false);
 	assert.equal(readFileSync(other, "utf8"), transcript);
 
 	const second = createSessionFile("abc123");
 	writeFileSync(second, transcript);
-	writeMetadata({ ...f.metadata, sessionFile: second, discardTranscript: true });
+	writeMetadata({ ...f.metadata, sessionFile: second, allocatedSessionFile: second, discardTranscript: true });
 	process.env.PI_CODING_AGENT_SESSION_DIR = join(f.root, "moved");
 	removeRunDir(f.runDir);
 	assert.equal(existsSync(second), false);

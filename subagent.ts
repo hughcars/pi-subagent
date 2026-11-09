@@ -799,7 +799,7 @@ async function stopSubagent(args: string[]): Promise<void> {
 	else if (metadata.discardTranscript === true) {
 		process.stdout.write(
 			existsSync(metadata.sessionFile)
-				? `Transcript not deleted: ${metadata.sessionFile} is not the file spawn allocated for this run.\n`
+				? `Transcript not deleted: the run switched to ${metadata.sessionFile}, which spawn did not allocate.\n`
 				: "Transcript deleted.\n",
 		);
 	}
