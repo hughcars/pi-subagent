@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
 	assistantText,
 	CLOSE_MESSAGE,
+	createRun,
 	DEFAULT_GRACE_SECONDS,
 	effectiveRunState,
 	getAgentDir,
@@ -49,7 +50,8 @@ function usage(): never {
 	fail(`Usage:
   subagent spawn [--name <name>] [--provider <provider>] [--model <model>] [--thinking <level>]
     [--cwd <dir>] [--tools <names>] [--no-extensions] [--no-skills]
-    [--no-prompt-templates] [--no-context-files] (--prompt <text> | --file <path>)...
+    [--no-prompt-templates] [--no-context-files] [--discard-transcript]
+    (--prompt <text> | --file <path>)...
   subagent status <handle> [--json]
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
@@ -59,6 +61,9 @@ function usage(): never {
   subagent fetch <handle> [dest]
   subagent hosts
   subagent list [--json]
+
+Spawn prints the run's transcript path. Stop keeps a non-empty transcript there for later
+  reading unless the run was spawned with --discard-transcript, which deletes it at stop.
 
 Interrupt presses Escape once in the child's pane, exactly as a human attached to it would.
   A running turn (bash, process wait, streaming) is aborted; background processes keep running.
@@ -125,6 +130,7 @@ function spawnSubagent(args: string[]): void {
 	let noSkills = false;
 	let noPromptTemplates = false;
 	let noContextFiles = false;
+	let discardTranscript = false;
 	const prompts: string[] = [];
 	const files: string[] = [];
 
@@ -178,6 +184,9 @@ function spawnSubagent(args: string[]): void {
 			case "--no-context-files":
 				noContextFiles = true;
 				break;
+			case "--discard-transcript":
+				discardTranscript = true;
+				break;
 			case "--prompt":
 				prompts.push(valueAfter(args, i, arg));
 				i++;
@@ -217,18 +226,12 @@ function spawnSubagent(args: string[]): void {
 			noSkills,
 			noPromptTemplates,
 			noContextFiles,
+			discardTranscript,
 			prompts,
 			files,
 		});
 		return;
 	}
-
-	const handle = generateHandle();
-	const runDir = runDirForHandle(handle);
-	const sessionFile = join(runDir, "session.jsonl");
-	const tmuxSession = `pi-subagent-${handle}`;
-	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
-	writeFileSync(sessionFile, "", { mode: 0o600 });
 
 	const launchArgs: string[] = [];
 	if (tools) launchArgs.push("--tools", tools);
@@ -237,38 +240,36 @@ function spawnSubagent(args: string[]): void {
 	if (noPromptTemplates) launchArgs.push("--no-prompt-templates");
 	if (noContextFiles) launchArgs.push("--no-context-files");
 
-	const now = new Date().toISOString();
-	const metadata: RunMetadata = {
-		version: 1,
-		handle,
+	const metadata = createRun({
+		handle: generateHandle(),
 		name,
 		parentSessionId: process.env.PI_SESSION_ID || undefined,
 		parentSessionFile: process.env.PI_SESSION_FILE || undefined,
-		tmuxSession,
-		runDir,
-		sessionFile,
 		cwd,
 		provider,
 		model,
 		thinking,
 		launchArgs,
-		state: "starting",
-		hasStarted: false,
-		createdAt: now,
-		updatedAt: now,
-	};
-	writeMetadata(metadata);
+		...(discardTranscript ? { discardTranscript } : {}),
+	});
 
 	const initialArgs = files.map((file) => `@${file}`);
 	if (prompts.length > 0) initialArgs.push(`Task:\n${prompts.join("\n\n")}`);
 	try {
 		launchRun(metadata, initialArgs);
 	} catch (error) {
-		removeRunDir(runDir);
+		removeRunDir(metadata.runDir);
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	process.stdout.write(
+		`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${metadata.tmuxSession}\n${transcriptLine(metadata)}\n`,
+	);
+}
+
+function transcriptLine(metadata: RunMetadata, host?: string): string {
+	const path = host ? `${host}:${metadata.sessionFile}` : metadata.sessionFile;
+	return `Transcript: ${path}${metadata.discardTranscript === true ? " (deleted at stop)" : ""}`;
 }
 
 const DEFAULT_SYNC_EXCLUDES = [".git", "node_modules", ".venv", "__pycache__"];
@@ -288,6 +289,7 @@ interface RemoteSpawnOptions {
 	noSkills: boolean;
 	noPromptTemplates: boolean;
 	noContextFiles: boolean;
+	discardTranscript: boolean;
 	prompts: string[];
 	files: string[];
 }
@@ -419,6 +421,7 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 	if (options.noSkills) cliArgs.push("--no-skills");
 	if (options.noPromptTemplates) cliArgs.push("--no-prompt-templates");
 	if (options.noContextFiles) cliArgs.push("--no-context-files");
+	if (options.discardTranscript) cliArgs.push("--discard-transcript");
 	for (const prompt of options.prompts) cliArgs.push("--prompt", prompt);
 	for (const file of remoteFiles) cliArgs.push("--file", file);
 	const env = process.env.PI_SESSION_ID ? `PI_SESSION_ID=${shq(process.env.PI_SESSION_ID)} ` : "";
@@ -452,7 +455,7 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 	};
 	writeMetadata(shadow);
 	process.stdout.write(
-		`Spawned ${runDisplayName(shadow)} on ${host}\nState: ${remoteMeta.state}\nAttach: ${remoteAttachCommand(shadow)}\n`,
+		`Spawned ${runDisplayName(shadow)} on ${host}\nState: ${remoteMeta.state}\nAttach: ${remoteAttachCommand(shadow)}\n${transcriptLine(remoteMeta, host)}\n`,
 	);
 }
 
@@ -790,8 +793,10 @@ async function stopSubagent(args: string[]): Promise<void> {
 	if (force && wasRunning) updateMetadata(metadata.runDir, { forceStopped: true });
 	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
-	removeRunDir(metadata.runDir);
+	const kept = removeRunDir(metadata.runDir);
 	if (force || !wasRunning) process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+	if (kept) process.stdout.write(`Transcript kept: ${kept}\n`);
+	else if (metadata.discardTranscript === true) process.stdout.write("Transcript deleted.\n");
 }
 
 function hostsSubagent(): void {

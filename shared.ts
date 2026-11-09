@@ -1,9 +1,16 @@
 import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	accessSync,
+	closeSync,
 	constants,
 	existsSync,
+	fsyncSync,
+	linkSync,
 	mkdirSync,
+	openSync,
+	realpathSync,
+	statSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
@@ -11,7 +18,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type RunState = "starting" | "busy" | "idle" | "closing" | "exited" | "error";
 
@@ -66,6 +73,8 @@ export interface RunMetadata {
 	paneId?: string;
 	runDir: string;
 	sessionFile: string;
+	/** Set at spawn when the transcript is deleted at teardown instead of kept for later reading. */
+	discardTranscript?: boolean;
 	cwd: string;
 	provider: string;
 	model: string;
@@ -223,8 +232,124 @@ export async function waitForRunShutdown(runDir: string, timeoutMs = 2000): Prom
 	}
 }
 
-export function removeRunDir(runDir: string): void {
+function inside(root: string, path: string): boolean {
+	const rel = relative(root, path);
+	return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+function sessionArchiveDir(): string {
+	const dir = resolve(process.env.PI_CODING_AGENT_SESSION_DIR || join(getAgentDir(), "sessions"), "subagents");
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	if (existsSync(getRunsDir()) && inside(realpathSync(getRunsDir()), realpathSync(dir))) {
+		throw new Error("Subagent session storage must be outside managed run directories");
+	}
+	return realpathSync(dir);
+}
+
+/**
+ * A run's transcript gets a stable private path before Pi starts, outside its control state, so
+ * whatever cites it while the run is alive (its spawn output, memory records) still names it after
+ * a kept transcript outlives teardown.
+ */
+export function createSessionFile(handle: string): string {
+	const file = join(sessionArchiveDir(), `${handle}-${randomUUID()}.jsonl`);
+	writeFileSync(file, "", { flag: "wx", mode: 0o600 });
+	return file;
+}
+
+type RunSetup = Pick<
+	RunMetadata,
+	"handle" | "name" | "parentSessionId" | "parentSessionFile" | "cwd" | "provider" | "model" | "thinking" | "launchArgs" | "discardTranscript"
+>;
+
+/** Allocate a run's control state and its transcript as one startup transaction. */
+export function createRun(setup: RunSetup): RunMetadata {
+	mkdirSync(getRunsDir(), { recursive: true, mode: 0o700 });
+	const runDir = join(getRunsDir(), setup.handle);
+	mkdirSync(runDir, { mode: 0o700 });
+	let sessionFile: string | undefined;
+	try {
+		mkdirSync(inboxDir(runDir), { mode: 0o700 });
+		sessionFile = createSessionFile(setup.handle);
+		const now = new Date().toISOString();
+		const metadata: RunMetadata = {
+			...setup, version: 1, runDir, sessionFile, tmuxSession: `pi-subagent-${setup.handle}`,
+			state: "starting", hasStarted: false, createdAt: now, updatedAt: now,
+		};
+		writeMetadata(metadata);
+		return metadata;
+	} catch (error) {
+		try {
+			if (sessionFile && statSync(sessionFile).size === 0) rmSync(sessionFile);
+			rmSync(runDir, { recursive: true, force: true });
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], `Subagent startup failed: ${String(error)}; cleanup failed: ${String(cleanupError)}`);
+		}
+		throw error;
+	}
+}
+
+function syncPath(path: string): void {
+	const fd = openSync(path, "r");
+	try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+/**
+ * Remove a stopped run's control state. A local run's non-empty transcript is kept, unless the run
+ * was spawned to discard it, and the kept path is returned. Remote transcripts are their host's.
+ */
+export function removeRunDir(runDir: string): string | undefined {
+	let control: string;
+	try { control = realpathSync(runDir); } catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+	const metadata = readMetadata(runDir);
+	if (!metadata) {
+		if (!existsSync(runDir)) return undefined;
+		throw new Error(`Refusing to delete ${runDir}: run metadata is missing or unreadable`);
+	}
+	let retained: string | undefined;
+	if (!isRemote(metadata) && existsSync(metadata.sessionFile)) {
+		let file: string;
+		let source: ReturnType<typeof statSync>;
+		try {
+			file = realpathSync(metadata.sessionFile);
+			source = statSync(file);
+		} catch (error) {
+			// A competing teardown may have finished between the existence check and open.
+			// Do not delete anything or claim an archive from this already-removed run.
+			if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(runDir)) return undefined;
+			throw error;
+		}
+		const archived = inside(realpathSync(sessionArchiveDir()), file);
+		if (source.size === 0 || metadata.discardTranscript === true) {
+			// An empty transcript is a launch that never wrote a session. A discarded one inside
+			// the run dir goes with it; only files in the archive are ever deleted on their own.
+			if (archived) rmSync(file, { force: true });
+		} else {
+			retained = file;
+			if (inside(control, file)) {
+				// Runs spawned before transcripts moved out of the run dir keep theirs here. A link
+				// publishes the same bytes without overwriting another archive. Concurrent stops may
+				// publish it first; inode identity proves that they retained this file.
+				const identity = createHash("sha256").update(`${metadata.createdAt}\0${metadata.childSessionId ?? ""}`).digest("hex");
+				retained = join(sessionArchiveDir(), `${basename(runDir)}-${identity}.jsonl`);
+				try { linkSync(file, retained); } catch (error) {
+					const code = (error as NodeJS.ErrnoException).code;
+					if (code !== "EEXIST" && code !== "ENOENT") throw error;
+					const target = statSync(retained);
+					if (target.dev !== source.dev || target.ino !== source.ino) {
+						throw new Error(`Refusing to overwrite retained transcript ${retained}`);
+					}
+				}
+			}
+			syncPath(retained);
+			syncPath(dirname(retained));
+		}
+	}
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+	return retained;
 }
 
 export function tmuxSessionExists(session: string): boolean {

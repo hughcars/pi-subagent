@@ -53,7 +53,14 @@ Three additional built-in tools are available but off by default:
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
 
-Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. When a child turn settles, the extension automatically sends this dispatching session a `subagent-state` message and triggers a parent turn as soon as the parent is idle; retrieve the durable result and continue when that message arrives. An explicit `wait` from this dispatching Pi session acknowledges the same result and prevents a redundant automatic turn; a wait from another shell does not. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
+## Transcript
+
+A child's transcript is kept after `stop` by default, at the path spawn prints, so its reasoning, commands, and results stay available to later readers and to memory tools that cite it. Pass `--discard-transcript` to have `stop` delete it instead. Choose this at spawn:
+
+- Keep it (the default) for investigations, builds, reviews, proofs, and measurements whose reasoning a later session may need. The parent sees only the child's report; the transcript is the only full record of how it got there.
+- Discard it for throwaway probes and smoke tests, high-volume runs whose results are recorded elsewhere, and runs that handled secrets or data that should not be stored.
+
+Spawn prints a random handle, the exact tmux attach command, and the transcript path. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. When a child turn settles, the extension automatically sends this dispatching session a `subagent-state` message and triggers a parent turn as soon as the parent is idle; retrieve the durable result and continue when that message arrives. An explicit `wait` from this dispatching Pi session acknowledges the same result and prevents a redundant automatic turn; a wait from another shell does not. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
 
 ## Inspect and wait
 
@@ -106,7 +113,7 @@ After an interrupt, the child takes `send` as normal.
 subagent stop <handle> [--grace <seconds>] [--force]
 ```
 
-`stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files it created) and write a closing report, which `stop` prints. The child then exits and its tmux session, transcript, and metadata are removed. Default grace is 900s; `--force` skips the cleanup turn and tears down immediately — use it for wedged children that `interrupt` cannot unblock. A graceful `stop` that is waiting when a `stop --force` ends the child reports "stopped by a concurrent stop --force" and no closing report. Stop every subagent when its work is done; keep an idle one alive only when concrete follow-up work is expected.
+`stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files it created) and write a closing report, which `stop` prints. The child then exits and its tmux session and control metadata are removed. `stop` then prints `Transcript kept: <path>` for a non-empty transcript, or `Transcript deleted.` for a run spawned with `--discard-transcript`; a remote run's transcript stays on, or is deleted on, its execution host. Default grace is 900s; `--force` skips the cleanup turn and tears down immediately — use it for wedged children that `interrupt` cannot unblock. A graceful `stop` that is waiting when a `stop --force` ends the child reports "stopped by a concurrent stop --force" and no closing report. Stop every subagent when its work is done; keep an idle one alive only when concrete follow-up work is expected.
 
 ## Remote hosts
 
