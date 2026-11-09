@@ -796,7 +796,13 @@ async function stopSubagent(args: string[]): Promise<void> {
 	const kept = removeRunDir(metadata.runDir);
 	if (force || !wasRunning) process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
 	if (kept) process.stdout.write(`Transcript kept: ${kept}\n`);
-	else if (metadata.discardTranscript === true) process.stdout.write("Transcript deleted.\n");
+	else if (metadata.discardTranscript === true) {
+		process.stdout.write(
+			existsSync(metadata.sessionFile)
+				? `Transcript not deleted: ${metadata.sessionFile} is not the file spawn allocated for this run.\n`
+				: "Transcript deleted.\n",
+		);
+	}
 }
 
 function hostsSubagent(): void {

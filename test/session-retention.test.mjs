@@ -186,6 +186,26 @@ test("a run spawned to discard its transcript deletes only its own archived file
 	assert.equal(readFileSync(external, "utf8"), transcript);
 });
 
+test("discarding unlinks the run's own path, not a linked target, whatever session root is set now", t => {
+	const f = fixture(t);
+	const other = createSessionFile("def456");
+	writeFileSync(other, transcript);
+	const sessionFile = createSessionFile("abc123");
+	rmSync(sessionFile);
+	fs.symlinkSync(other, sessionFile);
+	writeMetadata({ ...f.metadata, sessionFile, discardTranscript: true });
+	removeRunDir(f.runDir);
+	assert.equal(fs.existsSync(sessionFile) || fs.lstatSync(sessionFile, { throwIfNoEntry: false }) !== undefined, false);
+	assert.equal(readFileSync(other, "utf8"), transcript);
+
+	const second = createSessionFile("abc123");
+	writeFileSync(second, transcript);
+	writeMetadata({ ...f.metadata, sessionFile: second, discardTranscript: true });
+	process.env.PI_CODING_AGENT_SESSION_DIR = join(f.root, "moved");
+	removeRunDir(f.runDir);
+	assert.equal(existsSync(second), false);
+});
+
 test("CLI spawn --discard-transcript marks the run and stop deletes the transcript", t => {
 	const f = fixture(t);
 	const bin = join(f.root, "bin");

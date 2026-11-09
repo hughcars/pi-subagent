@@ -289,6 +289,14 @@ export function createRun(setup: RunSetup): RunMetadata {
 	}
 }
 
+const ALLOCATED_SESSION_SUFFIX = /^-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/;
+
+/** Whether the run's transcript is the file createSessionFile named for it. */
+function ownsSessionFile(metadata: RunMetadata): boolean {
+	const name = basename(metadata.sessionFile);
+	return name.startsWith(metadata.handle) && ALLOCATED_SESSION_SUFFIX.test(name.slice(metadata.handle.length));
+}
+
 function syncPath(path: string): void {
 	const fd = openSync(path, "r");
 	try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -322,11 +330,12 @@ export function removeRunDir(runDir: string): string | undefined {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(runDir)) return undefined;
 			throw error;
 		}
-		const archived = inside(realpathSync(sessionArchiveDir()), file);
 		if (source.size === 0 || metadata.discardTranscript === true) {
-			// An empty transcript is a launch that never wrote a session. A discarded one inside
-			// the run dir goes with it; only files in the archive are ever deleted on their own.
-			if (archived) rmSync(file, { force: true });
+			// An empty transcript is a launch that never wrote a session. A discarded one inside the
+			// run dir goes with it. Otherwise only the file createSessionFile allocated for this run is
+			// deleted, by its own name, whatever session root is configured now; unlinking that path
+			// never follows a link to another run's transcript.
+			if (ownsSessionFile(metadata)) rmSync(metadata.sessionFile, { force: true });
 		} else {
 			retained = file;
 			if (inside(control, file)) {
