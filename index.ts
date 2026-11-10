@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
 import {
+	attachWithRecovery,
+	type AttachResult,
 	effectiveRunState,
 	inboxDir,
 	isRemote,
@@ -17,6 +19,7 @@ import {
 	removeRunDir,
 	runDisplayName,
 	settlementDelivery,
+	sshAttachTransport,
 	type InboxMessage,
 	type RunMetadata,
 	type RunState,
@@ -111,22 +114,23 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!run) return;
 
 			if (isRemote(run)) {
+				const host = run.host as string;
+				let result: AttachResult | undefined;
 				tui.stop();
 				try {
-					const exitCode = await new Promise<number | null>((resolveExit) => {
-						const child = spawn(
-							"ssh",
-							["-t", run.host as string, "tmux", "attach-session", "-t", run.tmuxSession],
-								{ stdio: "inherit" },
-							);
-						child.on("error", () => resolveExit(null));
-						child.on("close", resolveExit);
-					});
-					if (exitCode !== 0) process.stderr.write(`Could not attach to ${run.handle} on ${run.host}\n`);
+					// With the TUI stopped the terminal is the plain screen, so progress goes to stderr.
+					result = await attachWithRecovery(
+						sshAttachTransport(host, run.tmuxSession),
+						{ where: `${run.handle} on ${host}`, host, tmuxSession: run.tmuxSession, term: process.env.TERM },
+						(line) => process.stderr.write(`${line}\n`),
+					);
 				} finally {
 					tui.start();
 					tui.requestRender(true);
 				}
+				// Reported once the TUI is back: it redraws over anything printed while it was stopped,
+				// which is how a failed attach used to vanish without a word.
+				if (result?.message) ctx.ui.notify(result.message, result.attached ? "info" : "error");
 				return;
 			}
 

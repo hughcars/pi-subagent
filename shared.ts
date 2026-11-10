@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	accessSync,
@@ -494,6 +494,162 @@ export function runRemote(host: string, command: string): string {
 
 export function remoteAttachCommand(metadata: RunMetadata): string {
 	return `ssh -t ${metadata.host} tmux attach-session -t ${shq(metadata.tmuxSession)}`;
+}
+
+// Attaching to a remote run, and recovering when the host refuses the terminal.
+//
+// ssh passes the local TERM to the host, and tmux there refuses a client whose TERM has no
+// terminfo entry ("missing or unsuitable terminal: xterm-kitty"). The attach then exits at
+// once with no usable message. attachWithRecovery finds the cause of a failed attach,
+// installs the missing entry in the host user's ~/.terminfo, and attaches again.
+
+/** A terminal type every host is assumed to describe; used when the local one cannot be installed there. */
+export const FALLBACK_TERM = "xterm-256color";
+
+/**
+ * ssh options for the recovery calls. The timeout is longer than SSH_OPTIONS': a
+ * ProxyCommand transport (AWS SSM, for example) can need 20 s to open, and a false
+ * "unreachable" here would hide the cause the caller is looking for.
+ */
+const ATTACH_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=30"];
+
+/** TERM values that are safe to name in a remote command and in a terminfo path. */
+export function isTerminalName(term: string | undefined): term is string {
+	return typeof term === "string" && /^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(term);
+}
+
+export interface AttachDiagnosis {
+	/** Why `tmux attach-session` on the host did not attach. */
+	failure: "no-session" | "unknown-terminal" | "unexplained";
+	/** The host has `tic`, so a terminfo entry can be compiled there. */
+	canInstall: boolean;
+}
+
+/** One remote command that prints, as `key=<exit status>` lines, the facts an attach depends on. */
+export function attachDiagnosisCommand(tmuxSession: string, term: string): string {
+	return [
+		`tmux has-session -t ${shq(tmuxSession)} 2>/dev/null; echo "session=$?"`,
+		`infocmp ${shq(term)} >/dev/null 2>&1; echo "terminfo=$?"`,
+		`command -v tic >/dev/null 2>&1; echo "tic=$?"`,
+	].join("; ");
+}
+
+/** Read the report that attachDiagnosisCommand printed. */
+export function classifyAttachFailure(report: string): AttachDiagnosis {
+	const status = (key: string): number | undefined => {
+		const match = new RegExp(`^${key}=(\\d+)$`, "m").exec(report);
+		return match ? Number(match[1]) : undefined;
+	};
+	const session = status("session");
+	const terminfo = status("terminfo");
+	if (session === undefined || terminfo === undefined) return { failure: "unexplained", canInstall: false };
+	if (session !== 0) return { failure: "no-session", canInstall: false };
+	// Any nonzero status counts as unknown. 1 is a missing entry. 127 is a host without
+	// infocmp: the entry cannot be confirmed there, and the fallback TERM is the safe attach.
+	if (terminfo !== 0) return { failure: "unknown-terminal", canInstall: status("tic") === 0 };
+	return { failure: "unexplained", canInstall: false };
+}
+
+/** The effects attachWithRecovery needs. sshAttachTransport is the real one; tests pass a fake. */
+export interface AttachTransport {
+	/** Attach interactively. `term` overrides the client's TERM on the host. Resolves to the exit status. */
+	attach(term?: string): Promise<number | null>;
+	/** Run attachDiagnosisCommand on the host. */
+	diagnose(term: string): Promise<{ code: number | null; stdout: string; stderr: string }>;
+	/** Copy the local terminfo entry for `term` into the host user's ~/.terminfo. */
+	installTerminfo(term: string): Promise<boolean>;
+}
+
+export interface AttachResult {
+	attached: boolean;
+	/** What the user must be told: why the attach failed, or what was changed on the host. */
+	message?: string;
+}
+
+/**
+ * Attach to a remote tmux session. When the attach fails, find the cause; when the cause is
+ * a terminal type the host does not know, install its description there (or fall back to
+ * FALLBACK_TERM when that is not possible) and attach once more. `progress` receives lines
+ * for the plain terminal while the recovery runs.
+ */
+export async function attachWithRecovery(
+	transport: AttachTransport,
+	target: { where: string; host: string; tmuxSession: string; term: string | undefined },
+	progress: (line: string) => void,
+): Promise<AttachResult> {
+	const { where, host, tmuxSession, term } = target;
+	const first = await transport.attach();
+	if (first === 0) return { attached: true };
+
+	// A nonzero status is also what a session that was attached and then lost its connection
+	// returns, so the wording does not claim that the attach never happened.
+	const ended = `Attach to ${where} ended with ssh exit ${first}`;
+	if (!isTerminalName(term)) return { attached: false, message: `${ended}. TERM is unset or is not a plain terminal name, so the cause was not checked.` };
+	progress(`${ended}; checking why...`);
+	const report = await transport.diagnose(term);
+	if (report.code !== 0) {
+		const detail = report.stderr.trim().split("\n").pop() || `ssh exit ${report.code}`;
+		return { attached: false, message: `Could not attach to ${where}: cannot reach ${host} (${detail})` };
+	}
+	const { failure, canInstall } = classifyAttachFailure(report.stdout);
+	if (failure === "no-session") {
+		return { attached: false, message: `Could not attach to ${where}: tmux session ${tmuxSession} no longer exists there` };
+	}
+	if (failure === "unexplained") {
+		return { attached: false, message: `${ended}. The tmux session exists and ${host} knows terminal ${term}.` };
+	}
+
+	if (canInstall && (await transport.installTerminfo(term))) {
+		const installed = `Installed the ${term} terminal description on ${host} (in ~/.terminfo)`;
+		progress(`${host} did not know terminal ${term}. ${installed}. Attaching...`);
+		const retry = await transport.attach();
+		return retry === 0
+			? { attached: true, message: `${installed}; ${host} did not know that terminal` }
+			: { attached: false, message: `Could not attach to ${where} (ssh exit ${retry}). ${installed}, and the attach still failed.` };
+	}
+	const unknown = `${host} does not know terminal ${term}, and its description could not be installed there`;
+	progress(`${unknown}. Attaching as ${FALLBACK_TERM}...`);
+	const retry = await transport.attach(FALLBACK_TERM);
+	return retry === 0
+		? { attached: true, message: `Attached as ${FALLBACK_TERM}: ${unknown}` }
+		: { attached: false, message: `Could not attach to ${where} (ssh exit ${retry}), also as ${FALLBACK_TERM}: ${unknown}` };
+}
+
+/** AttachTransport over ssh, for the tmux session of a remote run. */
+export function sshAttachTransport(host: string, tmuxSession: string): AttachTransport {
+	const capture = (command: string, input = "") =>
+		new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveRun) => {
+			const child = spawn("ssh", [...ATTACH_SSH_OPTIONS, host, command], { stdio: ["pipe", "pipe", "pipe"] });
+			let stdout = "";
+			let stderr = "";
+			child.stdout.on("data", (chunk) => {
+				stdout += String(chunk);
+			});
+			child.stderr.on("data", (chunk) => {
+				stderr += String(chunk);
+			});
+			child.on("error", (error) => resolveRun({ code: null, stdout, stderr: String(error) }));
+			child.on("close", (code) => resolveRun({ code, stdout, stderr }));
+			// ssh can exit before it reads stdin; without a listener that EPIPE would crash the caller.
+			child.stdin.on("error", () => {});
+			child.stdin.end(input);
+		});
+	return {
+		attach: (term) =>
+			new Promise((resolveExit) => {
+				const remote = [...(term ? ["env", `TERM=${term}`] : []), "tmux", "attach-session", "-t", tmuxSession];
+				const child = spawn("ssh", ["-t", host, ...remote], { stdio: "inherit" });
+				child.on("error", () => resolveExit(null));
+				child.on("close", resolveExit);
+			}),
+		diagnose: (term) => capture(attachDiagnosisCommand(tmuxSession, term)),
+		installTerminfo: async (term) => {
+			// -x keeps user-defined capabilities (kitty's, for example); tic -x compiles them.
+			const entry = spawnSync("infocmp", ["-a", "-x", term], { encoding: "utf8" });
+			if (entry.status !== 0 || !entry.stdout) return false;
+			return (await capture("mkdir -p ~/.terminfo && tic -x -o ~/.terminfo /dev/stdin", entry.stdout)).code === 0;
+		},
+	};
 }
 
 export function listRuns(parentSessionId?: string): RunMetadata[] {
