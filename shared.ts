@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	accessSync,
@@ -507,11 +507,100 @@ export function remoteAttachCommand(metadata: RunMetadata): string {
 export const FALLBACK_TERM = "xterm-256color";
 
 /**
- * ssh options for the recovery calls. The timeout is longer than SSH_OPTIONS': a
- * ProxyCommand transport (AWS SSM, for example) can need 20 s to open, and a false
- * "unreachable" here would hide the cause the caller is looking for.
+ * ssh options for calls whose failure the caller reads as a fact about the host: the attach
+ * diagnosis and the state poll. The timeout is longer than SSH_OPTIONS': a ProxyCommand
+ * transport (AWS SSM, for example) can need 20 s to open, and a connection that was only
+ * slow must not be taken for an unreachable host or a run that is still busy.
  */
-const ATTACH_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=30"];
+const PATIENT_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=30"];
+
+/** The longest such a call may take in all: connect, run the command, read the answer. */
+export const REMOTE_CALL_TIMEOUT_MS = 45000;
+
+interface RemoteCall {
+	code: number | null;
+	stdout: string;
+	stderr: string;
+	/** Set when the call was ended before its answer was complete: by the time limit, or by the caller. */
+	stopped?: "time limit" | "cancelled";
+}
+
+/**
+ * Run a command on a host and collect its output. Never rejects, and never outlives its time
+ * limit or the caller's signal. ConnectTimeout bounds only the connection: a transport that
+ * stalls after it, or a host too loaded to answer, would otherwise hold the caller for good.
+ * ssh runs in a process group of its own and the whole group is ended, because a ProxyCommand
+ * can outlive a signalled ssh. The call does not wait for the output pipes to close either:
+ * a process that outlived ssh may still hold them.
+ */
+function callRemote(
+	host: string,
+	command: string,
+	options: { input?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<RemoteCall> {
+	return new Promise((resolveCall) => {
+		if (options.signal?.aborted) return resolveCall({ code: null, stdout: "", stderr: "", stopped: "cancelled" });
+		let child: ChildProcessWithoutNullStreams;
+		try {
+			child = spawn("ssh", [...PATIENT_SSH_OPTIONS, host, command], { stdio: ["pipe", "pipe", "pipe"], detached: true });
+		} catch (error) {
+			// spawn throws at once for arguments it cannot pass, a NUL character for example.
+			return resolveCall({ code: null, stdout: "", stderr: error instanceof Error ? error.message : String(error) });
+		}
+		let stdout = "";
+		let stderr = "";
+		let exited: { code: number | null } | undefined;
+		let stdoutEnded = false;
+		let settled = false;
+		const settle = (result: RemoteCall): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(limit);
+			options.signal?.removeEventListener("abort", cancel);
+			child.stdout.destroy();
+			child.stderr.destroy();
+			resolveCall(result);
+		};
+		const stop = (stopped: "time limit" | "cancelled"): void => {
+			try {
+				if (child.pid) process.kill(-child.pid, "SIGTERM");
+			} catch {
+				// The group is already gone.
+			}
+			settle({ code: null, stdout, stderr, stopped });
+		};
+		const cancel = (): void => stop("cancelled");
+		const limit = setTimeout(() => stop("time limit"), options.timeoutMs ?? REMOTE_CALL_TIMEOUT_MS);
+		limit.unref();
+		options.signal?.addEventListener("abort", cancel, { once: true });
+		child.stdout.on("data", (chunk) => {
+			stdout += String(chunk);
+		});
+		child.stderr.on("data", (chunk) => {
+			stderr += String(chunk);
+		});
+		// ssh alone holds the stdout pipe, so its end and the exit status are the whole answer.
+		child.stdout.on("end", () => {
+			stdoutEnded = true;
+			if (exited) settle({ code: exited.code, stdout, stderr });
+		});
+		child.on("exit", (code) => {
+			exited = { code };
+			if (stdoutEnded) settle({ code, stdout, stderr });
+		});
+		child.on("error", (error) => settle({ code: null, stdout, stderr: error.message }));
+		// ssh can exit before it reads stdin; without a listener that EPIPE would crash the caller.
+		child.stdin.on("error", () => {});
+		child.stdin.end(options.input ?? "");
+	});
+}
+
+/** The reason a remote call gave no usable answer, for a message to the user. */
+function remoteCallFailure(call: RemoteCall, timeoutMs = REMOTE_CALL_TIMEOUT_MS): string {
+	if (call.stopped === "cancelled") return "cancelled";
+	if (call.stopped === "time limit") return `no answer within ${timeoutMs / 1000} s`;
+	return call.stderr.trim().split("\n").pop() || `ssh exit ${call.code}`;
+}
 
 /** TERM values that are safe to name in a remote command and in a terminfo path. */
 export function isTerminalName(term: string | undefined): term is string {
@@ -617,23 +706,11 @@ export async function attachWithRecovery(
 
 /** AttachTransport over ssh, for the tmux session of a remote run. */
 export function sshAttachTransport(host: string, tmuxSession: string): AttachTransport {
-	const capture = (command: string, input = "") =>
-		new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveRun) => {
-			const child = spawn("ssh", [...ATTACH_SSH_OPTIONS, host, command], { stdio: ["pipe", "pipe", "pipe"] });
-			let stdout = "";
-			let stderr = "";
-			child.stdout.on("data", (chunk) => {
-				stdout += String(chunk);
-			});
-			child.stderr.on("data", (chunk) => {
-				stderr += String(chunk);
-			});
-			child.on("error", (error) => resolveRun({ code: null, stdout, stderr: String(error) }));
-			child.on("close", (code) => resolveRun({ code, stdout, stderr }));
-			// ssh can exit before it reads stdin; without a listener that EPIPE would crash the caller.
-			child.stdin.on("error", () => {});
-			child.stdin.end(input);
-		});
+	// Bounded calls: /subagent waits for these with the TUI stopped.
+	const capture = async (command: string, input?: string) => {
+		const call = await callRemote(host, command, { input });
+		return call.stopped ? { code: null, stdout: call.stdout, stderr: remoteCallFailure(call) } : call;
+	};
 	return {
 		attach: (term) =>
 			new Promise((resolveExit) => {
@@ -650,6 +727,100 @@ export function sshAttachTransport(host: string, tmuxSession: string): AttachTra
 			return (await capture("mkdir -p ~/.terminfo && tic -x -o ~/.terminfo /dev/stdin", entry.stdout)).code === 0;
 		},
 	};
+}
+
+// Polling remote runs.
+//
+// A remote run lives in its host's tmux server, so the parent learns its state only by asking
+// the host. A poll that fails says nothing about the run: it must not look like "still busy".
+// pollRemoteRuns reports every failure. RemoteContact schedules the polls of each host on its
+// own, so a slow or dead host does not delay another, and keeps how long each has been
+// silent, so the widget can mark a state it could not confirm.
+
+/** How often the parent asks each host for the state of its runs. */
+export const REMOTE_POLL_MS = 20000;
+/** The states of a host that has not answered for longer than this are shown as unconfirmed. */
+export const REMOTE_STALE_MS = 3 * REMOTE_POLL_MS;
+/** Failed polls in a row after which the user is told, once, that a host does not answer. */
+export const REMOTE_OUTAGE_POLLS = 3;
+
+export type RemotePoll = { ok: true; runs: RunMetadata[] } | { ok: false; error: string };
+
+/**
+ * Ask a host for the metadata of all its runs. Never rejects, and never takes longer than the
+ * time limit. A signal cancels the poll, for a session that ends while its hosts are asked.
+ */
+export async function pollRemoteRuns(host: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RemotePoll> {
+	const call = await callRemote(host, `${REMOTE_CLI} list --json`, options);
+	if (call.stopped || call.code !== 0) return { ok: false, error: remoteCallFailure(call, options.timeoutMs) };
+	try {
+		const runs: unknown = JSON.parse(call.stdout);
+		if (!Array.isArray(runs)) throw new Error("not a list");
+		return { ok: true, runs: runs as RunMetadata[] };
+	} catch {
+		return { ok: false, error: "the answer was not a list of runs" };
+	}
+}
+
+/**
+ * The parent's contact with each remote host: when it was last asked, whether a poll of it is
+ * running, since when it has been silent, and how many polls have failed in a row.
+ */
+export class RemoteContact {
+	private readonly startedAt = new Map<string, number>();
+	private readonly polling = new Set<string>();
+	/** The time from which a host's silence counts: its last answer, or when asking it began. */
+	private readonly silentSince = new Map<string, number>();
+	private readonly failures = new Map<string, number>();
+
+	/** Whether to ask the host now: no poll of it is running and its period has passed. */
+	due(host: string, now: number): boolean {
+		if (this.polling.has(host)) return false;
+		const last = this.startedAt.get(host);
+		// `now < last` is a wall clock that stepped back: it must not postpone the poll.
+		return last === undefined || now >= last + REMOTE_POLL_MS || now < last;
+	}
+
+	/** A poll of the host starts. The period counts from here, so a slow poll does not stretch it. */
+	started(host: string, now: number): void {
+		const last = this.startedAt.get(host);
+		// Asking begins, or begins again after a break (the host had no runs, the machine
+		// slept, the clock stepped back): the silence counts from now, and so do the failures.
+		if (last === undefined || now < last || now - last > REMOTE_STALE_MS) {
+			this.silentSince.set(host, now);
+			this.failures.delete(host);
+		}
+		this.startedAt.set(host, now);
+		this.polling.add(host);
+	}
+
+	/** The poll ended with an answer that was recorded. */
+	answered(host: string, now: number): void {
+		this.polling.delete(host);
+		this.silentSince.set(host, now);
+		this.failures.delete(host);
+	}
+
+	/** The poll ended without one. True once for each outage, when the user should be told about it. */
+	failed(host: string): boolean {
+		this.polling.delete(host);
+		const failures = (this.failures.get(host) ?? 0) + 1;
+		this.failures.set(host, failures);
+		return failures === REMOTE_OUTAGE_POLLS;
+	}
+
+	/** How long the host has been silent, once that is long enough to doubt its states; otherwise undefined. */
+	silentFor(host: string, now: number): number | undefined {
+		const since = this.silentSince.get(host);
+		return since !== undefined && now - since > REMOTE_STALE_MS ? now - since : undefined;
+	}
+}
+
+/** What the widget adds to a remote run whose host is silent: the age of the state it shows. */
+export function remoteSilenceNote(silentForMs: number | undefined): string {
+	if (silentForMs === undefined) return "";
+	const minutes = Math.floor(silentForMs / 60000);
+	return ` (no answer ${minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h`})`;
 }
 
 export function listRuns(parentSessionId?: string): RunMetadata[] {

@@ -14,8 +14,10 @@ import {
 	listRuns,
 	parentRunWasInterrupted,
 	pendingSettlementToken,
+	pollRemoteRuns,
 	readMetadata,
-	REMOTE_CLI,
+	RemoteContact,
+	remoteSilenceNote,
 	removeRunDir,
 	runDisplayName,
 	settlementDelivery,
@@ -163,8 +165,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
 		let widgetContext: ExtensionContext | undefined;
 		const observedStates = new Map<string, RunState>();
-		const REMOTE_POLL_MS = 20000;
-		let remoteRefreshBusy = false;
+		// Pi makes a new extension instance for every session, so these last for one session.
+		const remoteContact = new RemoteContact();
+		const remotePolls = new AbortController();
 		let parentRunAborted = false;
 
 		const notifySettledRuns = (): void => {
@@ -218,62 +221,67 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			}
 		};
 
-		// Remote runs live in the host's tmux server; poll their real states over ssh so the
-		// widget and picker stay truthful. Runs stopped on the host side are dropped here.
+		// Remote runs live in the host's tmux server; ask each host for their real states over
+		// ssh so the widget and picker stay truthful. Runs stopped on the host side are dropped
+		// here. remoteContact schedules each host on its own, once per period counted from this
+		// session's polls of it: a slow or dead host does not delay another, and sessions do
+		// not all open their connections in the same second. A host that does not answer keeps
+		// its last known states, and remoteContact records the silence: the widget marks those
+		// states, and a lasting outage is reported once.
+		const pollHost = async (host: string, runs: RunMetadata[]): Promise<void> => {
+			const poll = await pollRemoteRuns(host, { signal: remotePolls.signal });
+			// The session ended while the host was asked.
+			if (!widgetContext) return;
+			let failure = poll.ok ? undefined : poll.error;
+			if (poll.ok) {
+				const remoteAll = poll.runs;
+				try {
+					for (const run of runs) {
+						const match = remoteAll.find((candidate) => candidate.handle === run.handle);
+						if (match) {
+							updateMetadata(run.runDir, {
+								state: match.state,
+								error: match.error,
+								hasStarted: match.hasStarted,
+								settledAt: match.settledAt,
+							});
+						} else {
+							removeRunDir(run.runDir);
+						}
+					}
+				} catch (error) {
+					// The shadows may hold old states, so the host does not count as answered.
+					failure = `its answer could not be recorded (${error instanceof Error ? error.message : String(error)})`;
+				}
+			}
+			if (failure === undefined) {
+				remoteContact.answered(host, Date.now());
+			} else if (remoteContact.failed(host) && widgetContext.hasUI) {
+				widgetContext.ui.notify(
+					`Cannot confirm the subagents on ${host}: ${failure}. Their shown states are unconfirmed until the host answers.`,
+					"warning",
+				);
+			}
+			refreshWidget();
+		};
+
 		const refreshRemoteStates = (): void => {
-			if (remoteRefreshBusy || !widgetContext) return;
-			const remoteRuns = listRuns(widgetContext.sessionManager.getSessionId()).filter(isRemote);
-			if (remoteRuns.length === 0) return;
-			remoteRefreshBusy = true;
+			if (!widgetContext) return;
 			const byHost = new Map<string, RunMetadata[]>();
-			for (const run of remoteRuns) {
+			for (const run of listRuns(widgetContext.sessionManager.getSessionId()).filter(isRemote)) {
 				const host = run.host as string;
 				const group = byHost.get(host) ?? [];
 				group.push(run);
 				byHost.set(host, group);
 			}
-			void (async () => {
-				for (const [host, runs] of byHost) {
-					try {
-						const child = spawn("ssh", [
-							"-o",
-							"BatchMode=yes",
-							"-o",
-							"ConnectTimeout=10",
-							host,
-							`${REMOTE_CLI} list --json`,
-						]);
-						let stdout = "";
-						child.stdout?.on("data", (chunk) => {
-								stdout += String(chunk);
-							});
-						const code = await new Promise<number | null>((resolveExit) => {
-							child.on("error", () => resolveExit(null));
-							child.on("close", resolveExit);
-						});
-						if (code !== 0) continue;
-						const remoteAll = JSON.parse(stdout) as RunMetadata[];
-						for (const run of runs) {
-								const match = remoteAll.find((candidate) => candidate.handle === run.handle);
-								if (match) {
-									updateMetadata(run.runDir, {
-										state: match.state,
-										error: match.error,
-										hasStarted: match.hasStarted,
-										settledAt: match.settledAt,
-									});
-								} else {
-									removeRunDir(run.runDir);
-								}
-							}
-						} catch {
-						// ssh or JSON failure: keep the last known states rather than guessing.
-						}
-					}
-					remoteRefreshBusy = false;
-					refreshWidget();
-				})();
-			};
+			const now = Date.now();
+			for (const [host, runs] of byHost) {
+				if (!remoteContact.due(host, now)) continue;
+				remoteContact.started(host, now);
+				// pollRemoteRuns never rejects; only a UI call in pollHost can throw.
+				void pollHost(host, runs).catch(() => {});
+			}
+		};
 
 		const refreshWidget = (): void => {
 			if (!widgetContext?.hasUI) return;
@@ -294,8 +302,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							: state === "error"
 								? "error"
 								: "muted";
-				const suffix = isRemote(run) ? `@${run.host}` : "";
-				return widgetContext!.ui.theme.fg(color, `${run.name ?? run.handle}:${state}${suffix}`);
+				// A host that stopped answering: say how old the shown state is, and dim it.
+				const silentFor = isRemote(run) ? remoteContact.silentFor(run.host as string, Date.now()) : undefined;
+				const suffix = isRemote(run) ? `@${run.host}${remoteSilenceNote(silentFor)}` : "";
+				return widgetContext!.ui.theme.fg(silentFor === undefined ? color : "muted", `${run.name ?? run.handle}:${state}${suffix}`);
 			});
 			if (activeRuns.length > visible.length) {
 				visible.push(widgetContext.ui.theme.fg("muted", `+${activeRuns.length - visible.length}`));
@@ -338,7 +348,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			widgetTimer = setInterval(() => {
 				notifySettledRuns();
 				refreshWidget();
-				if (Date.now() % REMOTE_POLL_MS < 1000) refreshRemoteStates();
+				refreshRemoteStates();
 			}, 1000);
 			widgetTimer.unref();
 		});
@@ -355,6 +365,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = undefined;
 			widgetContext = undefined;
+			// End the polls in flight: a hung ssh would otherwise outlive the session.
+			remotePolls.abort();
 			observedStates.clear();
 			if (ctx.hasUI) ctx.ui.setWidget("subagents", undefined);
 			if (event.reason === "reload") return;
