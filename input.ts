@@ -109,6 +109,12 @@ export function answerReceiptPath(runDir: string, replyId: string): string {
 	return join(runDir, `answer-${replyId}.json`);
 }
 
+/**
+ * The exit status of `wait` when it returns a pending question instead of a settled turn.
+ * Zero stays what it was before questions existed: the turn settled and its result was printed.
+ */
+export const WAIT_NEEDS_INPUT_EXIT = 2;
+
 export function inputInstructions(request: PendingInput): string {
 	return `Subagent ${request.handle} needs supervisor input (task NOT complete).\n` +
 		`Request: ${request.requestId}\nQuestion: ${request.question}\n` +
@@ -159,9 +165,14 @@ export class QuestionBridge {
 		else writePendingInput(this.runDir, undefined); // Runtime replacement invalidates an old process's promise.
 	}
 
-	/** Consume answers even while the model/tool is busy. Invalid replies leave the original request waiting. */
-	answer(value: unknown, parentSessionId: string | undefined): AnswerReceipt {
+	/**
+	 * Consume answers even while the model/tool is busy. Invalid replies leave the original request waiting.
+	 * A run that is closing takes no answer: stop marks the run before its close message is consumed, and a
+	 * reply queued ahead of that message must not resolve the tool after the supervisor chose to close.
+	 */
+	answer(value: unknown, parentSessionId: string | undefined, closing = false): AnswerReceipt {
 		try {
+			if (closing) throw new Error("Question cancelled: supervisor is closing this run");
 			const message = value as AnswerMessage;
 			if (!message || message.delivery !== "answer" || !isRequestId(message.replyId) ||
 				!isRequestId(message.requestId)) throw new Error("Malformed question reply");
@@ -179,8 +190,8 @@ export class QuestionBridge {
 		}
 	}
 
-	consumeAnswer(value: AnswerMessage, parentSessionId: string | undefined): void {
-		const receipt = this.answer(value, parentSessionId);
+	consumeAnswer(value: AnswerMessage, parentSessionId: string | undefined, closing = false): void {
+		const receipt = this.answer(value, parentSessionId, closing);
 		// Uncorrelatable malformed inbox data is discarded; never use it as a path.
 		if (isRequestId(value.replyId)) atomicJson(answerReceiptPath(this.runDir, value.replyId), receipt);
 	}

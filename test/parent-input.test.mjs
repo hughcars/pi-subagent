@@ -8,8 +8,8 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { acknowledgeInput, answerReceiptPath, inputAcknowledged, QuestionBridge, readPendingInput, writePendingInput } from "../input.ts";
-import { activeInput, displayRunState, readMetadata, syncRemoteRun, updateMetadata, writeMetadata } from "../shared.ts";
+import { acknowledgeInput, answerReceiptPath, inputAcknowledged, QuestionBridge, readPendingInput, WAIT_NEEDS_INPUT_EXIT, writePendingInput } from "../input.ts";
+import { activeInput, displayRunState, readMetadata, runRemoteBounded, syncRemoteRun, updateMetadata, writeMetadata } from "../shared.ts";
 import { piPackageForTests, resolvePiImportsFrom } from "./pi-package.mjs";
 
 // These tests load index.ts with Pi's real event bus and the separate question extension, so
@@ -134,8 +134,10 @@ integration("busy child wakes only its dispatching parent; CLI answer resolves t
 	assert.equal(parent.messages[0].message.details.state, "busy");
 	assert.ok(parent.widgets.some((w) => JSON.stringify(w).includes("waiting-input")));
 	assert.equal(resolved, false);
+	// Zero is kept for a settled turn, so a caller that branches on wait does not go on past a question.
 	const waiting = await f.cli("wait", "abc123", "--timeout", "1");
-	assert.equal(waiting.code, 0, waiting.stderr);
+	assert.equal(waiting.code, WAIT_NEEDS_INPUT_EXIT, waiting.stderr);
+	assert.equal(WAIT_NEEDS_INPUT_EXIT, 2);
 	assert.match(waiting.stdout, /needs supervisor input/);
 	assert.doesNotMatch(waiting.stdout, /abc123 finished/);
 	assert.equal(readMetadata(f.runDir).parentNotifiedSettledAt, undefined);
@@ -215,10 +217,11 @@ integration("busy-to-idle delivery retries failed sends, while explicit parent w
 	assert.equal(inputAcknowledged(f.runDir, request.requestId), false);
 	const outsider = await runFile(process.execPath, [cliPath, "wait", "abc123", "--timeout", "1"], {
 		env: { ...process.env, PI_SESSION_ID: "outsider" },
-	});
+	}).catch((error) => error);
+	assert.equal(outsider.code, WAIT_NEEDS_INPUT_EXIT);
 	assert.match(outsider.stdout, /needs supervisor input/);
 	assert.equal(inputAcknowledged(f.runDir, request.requestId), false);
-	assert.equal((await f.cli("wait", "abc123", "--timeout", "1")).code, 0);
+	assert.equal((await f.cli("wait", "abc123", "--timeout", "1")).code, WAIT_NEEDS_INPUT_EXIT);
 	assert.equal(inputAcknowledged(f.runDir, request.requestId), true);
 	await parent.tick(); assert.equal(parent.messages.length, 1);
 	assert.equal(readMetadata(f.runDir).parentNotifiedSettledAt, undefined);
@@ -391,7 +394,7 @@ integration("remote CLI relay forwards correlated answers and imports pending-in
 	assert.equal(status.code, 0, status.stderr);
 	assert.deepEqual(JSON.parse(status.stdout).pendingInput, input);
 	const waiting = await f.cli("wait", "abc123", "--timeout", "1");
-	assert.equal(waiting.code, 0, waiting.stderr);
+	assert.equal(waiting.code, WAIT_NEEDS_INPUT_EXIT, waiting.stderr); // The host's status is passed on.
 	assert.match(waiting.stdout, /task NOT complete/);
 	assert.equal(inputAcknowledged(f.runDir, input.requestId), true);
 	assert.equal(readMetadata(f.runDir).parentNotifiedSettledAt, undefined);
@@ -400,6 +403,90 @@ integration("remote CLI relay forwards correlated answers and imports pending-in
 	const commands = readFileSync(logPath, "utf8");
 	assert.match(commands, /PI_SESSION_ID='parent'/);
 	assert.ok(commands.includes(`'${input.requestId}' '--text' 'don'\\''t use $HOME; wait'`));
+});
+
+integration("a reply queued ahead of the close message cannot resolve the tool once stop has marked the run", async (t) => {
+	const f = fixture(t), child = await harness(t, f, { child: true });
+	const result = child.ask(); const failed = assert.rejects(result, /supervisor close/);
+	const request = readPendingInput(f.runDir), replyId = randomUUID();
+	mkdirSync(join(f.runDir, "inbox"));
+	// The inbox is consumed in file-name order: the answer sorts before the close message.
+	writeFileSync(join(f.runDir, "inbox", `0-${replyId}.json`), JSON.stringify({ delivery: "answer", handle: "abc123",
+		requestId: request.requestId, replyId, parentSessionId: "parent", answer: { kind: "option", option: 1 } }));
+	writeFileSync(join(f.runDir, "inbox", "1-close.json"), JSON.stringify({ delivery: "close", message: "cleanup" }));
+	updateMetadata(f.runDir, { state: "closing", closing: true }); // What `stop` writes before it queues the close.
+	await child.tick(); await failed;
+	const receipt = JSON.parse(readFileSync(answerReceiptPath(f.runDir, replyId), "utf8"));
+	assert.equal(receipt.accepted, false);
+	assert.match(receipt.error, /closing this run/);
+	assert.equal(readPendingInput(f.runDir), undefined);
+	assert.deepEqual(child.prompts, [{ message: "cleanup", options: { deliverAs: "followUp" } }]);
+});
+
+/** A remote run whose fake ssh answers the three relayed verbs as the given shell fragments say. */
+function remoteRelay(f, { answer, status }) {
+	updateMetadata(f.runDir, { host: "fake-host" });
+	const input = { version: 1, handle: "abc123", requestId: randomUUID(), question: "Remote?",
+		options: [{ label: "Yes" }], createdAt: new Date().toISOString() };
+	writePendingInput(f.runDir, input);
+	writeFileSync(join(f.root, "bin", "ssh"), `#!/bin/sh\nfor arg do command="$arg"; done\ncase "$command" in\n  *" answer "*) ${answer};;\n  *" status "*) ${status};;\n  *) exit 1;;\nesac\n`, { mode: 0o700 });
+	return input;
+}
+
+test("an answer the host accepted stays a success when the status refresh after it fails", async (t) => {
+	const f = fixture(t);
+	const input = remoteRelay(f, { answer: "printf 'Answered abc123 on the host\\n'", status: "echo 'ssh: connection lost' >&2; exit 255" });
+	const answer = await f.cli("answer", "abc123", input.requestId, "--option", "1");
+	assert.equal(answer.code, 0, answer.stderr);
+	assert.match(answer.stdout, /Answered abc123 on the host/);
+	assert.equal(inputAcknowledged(f.runDir, input.requestId), true);
+	// A status answer that is not a run record does not fail it either.
+	const other = fixture(t);
+	const again = remoteRelay(other, { answer: "printf 'Answered abc123 on the host\\n'", status: "echo 'not json'" });
+	assert.equal((await other.cli("answer", "abc123", again.requestId, "--option", "1")).code, 0);
+	// Nor does a local acknowledgement that cannot be written.
+	const blocked = fixture(t);
+	const third = remoteRelay(blocked, { answer: "printf 'Answered abc123 on the host\\n'", status: "exit 1" });
+	writeFileSync(join(blocked.runDir, "input-acks"), "a file where the directory belongs");
+	const accepted = await blocked.cli("answer", "abc123", third.requestId, "--option", "1");
+	assert.equal(accepted.code, 0, accepted.stderr);
+	assert.match(accepted.stdout, /Answered abc123 on the host/);
+});
+
+test("a connection that fails during the relay is uncertain delivery, not the host's refusal", async (t) => {
+	const f = fixture(t);
+	const input = remoteRelay(f, { answer: "echo 'Connection reset by peer' >&2; exit 255", status: "exit 255" });
+	const answer = await f.cli("answer", "abc123", input.requestId, "--option", "1");
+	assert.equal(answer.code, 1);
+	assert.match(answer.stderr, /Connection reset by peer/);
+	assert.match(answer.stderr, /delivery is uncertain/);
+	assert.equal(inputAcknowledged(f.runDir, input.requestId), false);
+});
+
+test("an answer the host refused is a failure that carries the host's reason", async (t) => {
+	const f = fixture(t);
+	const input = remoteRelay(f, { answer: "echo 'Stale or wrong question request' >&2; exit 1", status: "exit 1" });
+	const answer = await f.cli("answer", "abc123", input.requestId, "--option", "1");
+	assert.equal(answer.code, 1);
+	assert.match(answer.stderr, /Stale or wrong question request/);
+	assert.doesNotMatch(answer.stderr, /uncertain/);
+	assert.equal(inputAcknowledged(f.runDir, input.requestId), false);
+});
+
+test("a remote command with no answer inside its limit, or a failed connection, gives no verdict; a host's refusal does", async (t) => {
+	const f = fixture(t);
+	writeFileSync(join(f.root, "bin", "ssh"), "#!/bin/sh\nexec sleep 30\n", { mode: 0o700 });
+	const started = Date.now();
+	const hung = await runRemoteBounded("fake-host", "answer", { timeoutMs: 300 });
+	assert.ok(Date.now() - started < 5000, "the call ended at its limit");
+	assert.deepEqual({ ok: hung.ok, noVerdict: hung.noVerdict }, { ok: false, noVerdict: true });
+	writeFileSync(join(f.root, "bin", "ssh"), "#!/bin/sh\necho 'ssh: connect to host fake-host port 22: Connection refused' >&2; exit 255\n", { mode: 0o700 });
+	const lost = await runRemoteBounded("fake-host", "answer", { timeoutMs: 5000 });
+	assert.deepEqual({ ok: lost.ok, noVerdict: lost.noVerdict }, { ok: false, noVerdict: true });
+	writeFileSync(join(f.root, "bin", "ssh"), "#!/bin/sh\necho 'no such run' >&2; exit 1\n", { mode: 0o700 });
+	const refused = await runRemoteBounded("fake-host", "answer", { timeoutMs: 5000 });
+	assert.deepEqual({ ok: refused.ok, noVerdict: refused.noVerdict, failure: refused.failure },
+		{ ok: false, noVerdict: false, failure: "no such run" });
 });
 
 test("parent metadata writes and delayed acknowledgements cannot resurrect cancelled input", (t) => {

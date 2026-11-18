@@ -78,7 +78,7 @@ Run `subagent list` at any time to rediscover active subagents and their handles
 
 A child that needs a decision from you calls its `question` tool; when a decision is likely, say so in its prompt. You answer with `subagent answer`. This also works when the child has an active goal: the call waits inside the child's turn, so the goal cannot go on past the question until you answer. Do not ask a child to end its turn or write its question to a file instead.
 
-A managed child's `question` tool can send a `subagent-state` attention message before its turn settles. Status/list/widget show `waiting-input`; JSON keeps `state: "busy"` and includes `pendingInput`. `wait` returns the question and options with exit status 0. This is **not a completed task**. A wait from the dispatching session acknowledges the attention message only.
+A managed child's `question` tool can send a `subagent-state` attention message before its turn settles. Status/list/widget show `waiting-input`; JSON keeps `state: "busy"` and includes `pendingInput`. `wait` prints the question and options and exits with status 2: this is **not a completed task** (status 0 means the turn settled). The child needs a `question` extension that emits `question:request:v1`; on a remote host you install it yourself, `spawn` does not. A wait from the dispatching session acknowledges the attention message only.
 
 ```sh
 subagent answer <handle> <request-id> --option 1
