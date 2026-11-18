@@ -75,6 +75,8 @@ subagent list
 
 ### Questions and supervisor input
 
+A child that needs a decision calls its `question` tool, and the session that started it answers with `subagent answer`. This also works when the child has an active goal: the call waits inside the child's turn, so the goal cannot go on past the question until the answer arrives.
+
 With a transport-aware `question` extension loaded in the child, the ordinary `question` tool sends its question and option descriptions to the dispatching parent instead of opening a child modal. The parent receives a `subagent-state` attention message through the same durable delivery path as settlement notifications. Busy parents defer delivery; interrupted parents display it without restarting; print/JSON parents leave it pending. Parent `/reload` preserves active requests and their delivery acknowledgements.
 
 `status`, `list`, and the widget show `waiting-input`. The underlying JSON `state` stays `busy`, with a `pendingInput` snapshot containing the request ID, question, and options. `wait` returns that question promptly with exit status 0: this means the question was retrieved, **not that the task completed**. A dispatching parent's `wait` acknowledges only that attention message, never a settlement. Status/list and other sessions' waits do not acknowledge it.
