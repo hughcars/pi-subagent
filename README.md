@@ -73,16 +73,38 @@ subagent list
 
 `wait` is still useful when the result is required synchronously in the current turn. Do not start a separate polling loop merely to notice completion: the automatic state message wakes the parent after every settled child turn.
 
+### Questions and supervisor input
+
+With a transport-aware `question` extension loaded in the child, the ordinary `question` tool sends its question and option descriptions to the dispatching parent instead of opening a child modal. The parent receives a `subagent-state` attention message through the same durable delivery path as settlement notifications. Busy parents defer delivery; interrupted parents display it without restarting; print/JSON parents leave it pending. Parent `/reload` preserves active requests and their delivery acknowledgements.
+
+`status`, `list`, and the widget show `waiting-input`. The underlying JSON `state` stays `busy`, with a `pendingInput` snapshot containing the request ID, question, and options. `wait` returns that question promptly with exit status 0: this means the question was retrieved, **not that the task completed**. A dispatching parent's `wait` acknowledges only that attention message, never a settlement. Status/list and other sessions' waits do not acknowledge it.
+
+Answer with exactly one response, using the request ID printed by `wait` or the notification:
+
+```sh
+subagent answer <handle> <request-id> --option 1
+subagent answer <handle> <request-id> --text "Use the existing hook"
+subagent answer <handle> <request-id> --cancel
+```
+
+Only the dispatching `PI_SESSION_ID` may answer. The CLI waits up to 10 seconds for child acceptance. It rejects stale, malformed, and out-of-range replies; a timeout reports uncertain delivery, so check status before retrying. Answering resolves the original tool call through the control inbox while the child is busy. It does not send another model prompt. Answers are labelled **supervisor input, not end-user authorization**. Use `--text` for free text; option numbers refer only to the listed concrete choices. After answering, wait for the task result.
+
+An abort or child reload/shutdown invalidates the request. Graceful `stop` cancels a pending question before queuing the existing cleanup turn, so it does not wait behind that question. Questions during close fail rather than block cleanup. An older question extension without the transport hook still opens its local UI.
+
+The small event protocol is `question:request:v1`: `{ question, options: [{ label, description? }], signal?, claim }`. A handler calls `claim()` synchronously and receives `{ resolve, reject }`; only the first claim succeeds. Resolve with `{ source: "supervisor", kind: "option", option: N }`, `{ source: "supervisor", kind: "text", text }`, or `{ source: "supervisor", kind: "cancel" }`. Reject on transport failure or lifecycle cancellation. An unclaimed request keeps the standalone question UI; a claimed request never falls back to a second UI. `input.ts` owns request persistence, correlation, and resolvers. Local `pending-input.json` is child-owned; immutable `input-acks/<request-id>` files are parent-owned and cannot restore a cancelled request through a metadata write.
+
+Remote status/list relay the same snapshot, and `answer` forwards the correlated command over SSH. Remote state is last-known until refresh (normally within 20 seconds); the host validates every answer. Deploy the transport-aware question extension on the host too: provisioning copies the subagent package, not the separate question extension.
+
 ### Interrupt
 
-`subagent interrupt <handle>` presses Escape once in the child's tmux pane (`tmux send-keys Escape`), the same as attaching and pressing Escape by hand. The key goes to the pane pi runs in, even if someone opened another window in the child's session. It then waits up to 10 seconds for the child to settle and prints its state. Use it to unblock a stuck child. `send` cannot do this, because a message to a busy child waits behind the running tool call. `stop` cannot do it either: it ends the child, and its graceful close also waits for the current turn.
+`subagent interrupt <handle>` presses Escape once in the child's tmux pane (`tmux send-keys Escape`), the same as attaching and pressing Escape by hand. The key goes to the pane pi runs in, even if someone opened another window in the child's session. It then waits up to 10 seconds for the child to settle and prints its state. Use it to unblock a stuck child. `send` cannot do this, because a message to a busy child waits behind the running tool call. `stop` ends the child; its graceful close waits for the current turn except that it cancels a managed pending question first.
 
 What Escape does depends on the child's state:
 
 | Child state | Effect of `interrupt` |
 |---|---|
 | Running a tool (bash, `process wait`) or streaming | Aborts the turn. The transcript records the tool as aborted, or keeps the partial answer with `stopReason: aborted`. The child goes idle. Background processes started with the `process` tool keep running. `wait` then prints the aborted turn and exits 1. |
-| Open dialog (e.g. the `question` tool) | Cancels only the dialog. The tool returns "cancelled" and the turn continues, so the child can still be busy when `interrupt` returns. |
+| Open local dialog (e.g. an older `question` tool without the transport hook) | Cancels only the dialog. The tool returns "cancelled" and the turn continues, so the child can still be busy when `interrupt` returns. |
 | Idle | No effect. Two Escapes within 0.5 s run pi's double-Escape action (the session tree by default). One more Escape closes it. |
 
 **Queued messages are not delivered.** If you `send` (steer or `--follow-up`) to a busy child and then `interrupt` an aborting turn, pi moves every queued message into the child's editor. It does not send them. They stay there until someone presses Enter in the pane. Later `send` calls do not flush them. To get them through, send them again after the interrupt. In the dialog case, Escape does not reach the editor, so queued messages are delivered when the turn continues.
@@ -112,7 +134,7 @@ Each run's transcript has a private, stable path under `<session-root>/subagents
 
 ## Remote hosts
 
-A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, interrupt, wait, stop, rename) is forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t`. Hosts are configured in `~/.pi/agent/subagent.json`:
+A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, answer, interrupt, wait, stop, rename) is forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t`. Hosts are configured in `~/.pi/agent/subagent.json`:
 
 ```json
 {
@@ -138,6 +160,16 @@ The parent learns a remote run's state by asking its host every 20 s, and the "f
 `subagent hosts` lists the configured registry with live reachability and active run counts, so callers can discover usable hosts before spawning. Creating new compute is not this tool's job — discover first, provision only when nothing is usable.
 
 `subagent stop` is a graceful close, not a kill: the child gets one final turn to clean up after itself (kill background processes it started, remove scratch files) and write a closing report, which `stop` prints before the teardown removes tmux, control metadata, the transcript if the run was spawned with `--discard-transcript`, and — for remote runs — the synced work directory. The work directory is removed only when the child closed after its cleanup turn; otherwise it stays on the host, and a graceful `stop` prints its path. Default grace is 900 seconds; `--force` tears down immediately. If a `stop --force` ends the child while a graceful `stop` waits for it, the graceful `stop` says so and prints no report. Children never terminate on a timer: only a supervisor's close ends them.
+
+## Tests
+
+`npm test` runs the tests that need no Pi install. Tests that load `index.ts` are opt-in: set `PI_TEST_PI_ROOT` to the installed Pi package (see `test/pi-package.mjs`). The question tests also need the separate transport-aware question extension:
+
+```sh
+PI_TEST_PI_ROOT=/path/to/pi-coding-agent PI_QUESTION_EXTENSION=/path/to/question.ts npm test
+```
+
+They use Pi's own event bus and question UI, a deterministic extension context, and CLI subprocesses. tmux and ssh are faked; no model call or remote host is needed.
 
 ## License
 

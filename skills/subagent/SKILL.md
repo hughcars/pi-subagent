@@ -74,6 +74,20 @@ Run `subagent list` at any time to rediscover active subagents and their handles
 
 `wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline. Use a blocking wait only when the result is required in the current turn; do not build a polling or process-monitor ceremony solely to notice completion, because the automatic `subagent-state` message does that.
 
+## Answer pending questions
+
+A managed child's `question` tool can send a `subagent-state` attention message before its turn settles. Status/list/widget show `waiting-input`; JSON keeps `state: "busy"` and includes `pendingInput`. `wait` returns the question and options with exit status 0. This is **not a completed task**. A wait from the dispatching session acknowledges the attention message only.
+
+```sh
+subagent answer <handle> <request-id> --option 1
+subagent answer <handle> <request-id> --text "Use the existing hook"
+subagent answer <handle> <request-id> --cancel
+```
+
+Use exactly one response and the request ID from the notification or `wait`. `answer` requires the dispatching `PI_SESSION_ID`, validates the reply, and resolves the original question call through the inbox while the child is busy. Do not use `send`, Escape, or terminal keystrokes to answer it. A supervisor answer is not end-user authorization: ask the user when their permission is required. After answering, wait for the task result. An answer timeout means delivery is uncertain; check status before retrying.
+
+Parent reload preserves an active request. Child abort/reload/shutdown invalidates it, so a delayed answer cannot resolve a later question. Graceful `stop` cancels a pending managed question before queuing cleanup.
+
 ## Communicate
 
 ```sh
@@ -95,10 +109,10 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent interrupt <handle>
 ```
 
-`interrupt` presses Escape once in the child's pane, the same as a human who attaches and presses Escape. The key goes to the pane pi runs in, even if someone opened another window in the child's session. It waits up to 10s for the child to settle, then prints the state. Use it when a child is stuck: in a long bash command, a long `process wait`, a `question` dialog, or a runaway answer. `send` cannot unblock a child: a message to a busy child waits behind the running tool call. `stop` ends the child, and its graceful close also waits for the current turn.
+`interrupt` presses Escape once in the child's pane, the same as a human who attaches and presses Escape. The key goes to the pane pi runs in, even if someone opened another window in the child's session. It waits up to 10s for the child to settle, then prints the state. Use it when a child is stuck: in a long bash command, a long `process wait`, a `question` dialog, or a runaway answer. `send` cannot unblock a child: a message to a busy child waits behind the running tool call. `stop` ends the child; its graceful close waits for the current turn except that it cancels a managed pending question first.
 
 - Running a tool or streaming: the turn is aborted and the child goes idle. Background processes started with the `process` tool keep running. `wait` prints the aborted turn and exits 1.
-- Open dialog (`question`): only the dialog is cancelled. The tool returns "cancelled" and the turn continues, so the child may still be `busy` when `interrupt` returns. Use `wait` to follow it.
+- Open local dialog (for example, an older `question` without the transport hook): only the dialog is cancelled. The tool returns "cancelled" and the turn continues, so the child may still be `busy` when `interrupt` returns. Use `wait` to follow it.
 - Idle: no effect. Do not run `interrupt` twice within half a second. Two Escapes open pi's session tree; one more `interrupt` closes it.
 
 **Queued messages are lost to the child when a turn is aborted.** A message from `send` or `send --follow-up` that is still queued when `interrupt` aborts the turn is not delivered. Pi moves it into the child's editor, and it stays there. Later `send` calls do not flush it. If the child still needs the message, `send` it again after the interrupt. Better: interrupt first, then send the new instruction. In the dialog case, the queued message is delivered when the turn continues.
@@ -117,7 +131,7 @@ subagent stop <handle> [--grace <seconds>] [--force]
 
 ## Remote hosts
 
-A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, interrupt, wait, stop, rename) is transparently forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t <host>`.
+A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, answer, interrupt, wait, stop, rename) is transparently forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t <host>`.
 
 Hosts are configured in `~/.pi/agent/subagent.json`; read that file to see which hosts exist before spawning remotely:
 

@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { acknowledgeInput, inputAcknowledged, isPendingInput, readPendingInput, writePendingInput, type PendingInput } from "./input.ts";
 
 export type RunState = "starting" | "busy" | "idle" | "closing" | "exited" | "error";
 
@@ -98,6 +99,9 @@ export interface RunMetadata {
 	settledAt?: string;
 	/** Latest settledAt token delivered to this run's dispatching parent session. */
 	parentNotifiedSettledAt?: string;
+	/** Read-only snapshots from separate child request / parent acknowledgement files. */
+	pendingInput?: PendingInput;
+	parentNotifiedInputId?: string;
 	createdAt: string;
 	updatedAt: string;
 	error?: string;
@@ -199,7 +203,12 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 		) {
 			return undefined;
 		}
-		return metadata as RunMetadata;
+		const pendingInput = readPendingInput(runDir);
+		return {
+			...metadata,
+			pendingInput: pendingInput?.handle === metadata.handle ? pendingInput : undefined,
+			parentNotifiedInputId: pendingInput && inputAcknowledged(runDir, pendingInput.requestId) ? pendingInput.requestId : undefined,
+		} as RunMetadata;
 	} catch {
 		return undefined;
 	}
@@ -209,7 +218,10 @@ export function writeMetadata(metadata: RunMetadata): void {
 	mkdirSync(dirname(metadataPath(metadata.runDir)), { recursive: true, mode: 0o700 });
 	const target = metadataPath(metadata.runDir);
 	const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-	writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	// Never persist these snapshots through a metadata read-modify-write. The child alone
+	// owns a local request; parent acknowledgements cannot revive a cancelled question.
+	const { pendingInput: _input, parentNotifiedInputId: _ack, ...stored } = metadata;
+	writeFileSync(temporary, `${JSON.stringify(stored, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 	renameSync(temporary, target);
 }
 
@@ -451,6 +463,25 @@ export function pendingSettlementToken(
 		!metadata.settledAt && previousState !== undefined && previousState !== "idle" && currentState === "idle";
 	const token = metadata.settledAt ?? (legacySettled ? `legacy:${metadata.updatedAt}` : undefined);
 	return token && metadata.parentNotifiedSettledAt !== token ? token : undefined;
+}
+
+export function activeInput(metadata: RunMetadata, state = effectiveRunState(metadata)): PendingInput | undefined {
+	return state === "busy" && !metadata.closing && !metadata.suspended ? metadata.pendingInput : undefined;
+}
+
+export function displayRunState(metadata: RunMetadata): string {
+	const state = effectiveRunState(metadata);
+	return activeInput(metadata, state) ? "waiting-input" : state;
+}
+
+/** A remote status/list snapshot, not an owner transfer. Replies are validated on the host. */
+export function syncRemoteRun(local: RunMetadata, remote: RunMetadata): void {
+	updateMetadata(local.runDir, {
+		state: remote.state, error: remote.error, hasStarted: remote.hasStarted, settledAt: remote.settledAt,
+	});
+	const input = isPendingInput(remote.pendingInput) && remote.pendingInput.handle === local.handle ? remote.pendingInput : undefined;
+	writePendingInput(local.runDir, input);
+	if (input && remote.parentNotifiedInputId === input.requestId) acknowledgeInput(local.runDir, input.requestId);
 }
 
 export type SettlementDelivery = "trigger" | "display";

@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 
-import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	activeInput,
 	assistantText,
 	CLOSE_MESSAGE,
 	createRun,
+	displayRunState,
 	DEFAULT_GRACE_SECONDS,
 	effectiveRunState,
 	getAgentDir,
@@ -33,11 +35,14 @@ import {
 	type RunMetadata,
 	SSH_OPTIONS,
 	shq,
+	syncRemoteRun,
 	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
 	writeMetadata,
 } from "./shared.ts";
+
+import { acknowledgeInput, answerReceiptPath, inputInstructions, isRequestId, validateAnswer, type AnswerMessage, type AnswerReceipt, type InputAnswer } from "./input.ts";
 
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
@@ -55,6 +60,7 @@ function usage(): never {
   subagent status <handle> [--json]
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
+  subagent answer <handle> <request-id> (--option N | --text TEXT | --cancel)
   subagent interrupt <handle>
   subagent wait <handle> [--timeout <seconds>]
   subagent stop <handle> [--grace <seconds>] [--force]
@@ -72,6 +78,8 @@ Interrupt presses Escape once in the child's pane, exactly as a human attached t
   turn continues with any queued message. Idle: no effect, but two interrupts within 0.5s
   trigger pi's double-Escape action (the session tree by default); one more closes it.
   Use send to redirect work and stop to end it.
+  Managed questions use answer, not send or Escape. wait returns pending input without
+  reporting task completion; answer resolves that exact question as supervisor input.
 
 Remote hosts:
   subagent spawn --host <ssh-alias> [--remote-cwd <dir>] ...   rsyncs --cwd to the host first
@@ -454,6 +462,7 @@ function spawnRemoteSubagent(host: string, remoteCwdFlag: string | undefined, op
 		parentSessionFile: process.env.PI_SESSION_FILE || undefined,
 	};
 	writeMetadata(shadow);
+	syncRemoteRun(shadow, remoteMeta);
 	process.stdout.write(
 		`Spawned ${runDisplayName(shadow)} on ${host}\nState: ${remoteMeta.state}\nAttach: ${remoteAttachCommand(shadow)}\n${transcriptLine(remoteMeta, host)}\n`,
 	);
@@ -468,12 +477,7 @@ function statusSubagent(args: string[]): void {
 		const remoteMeta = JSON.parse(
 			runRemote(metadata.host as string, `${REMOTE_CLI} status ${shq(metadata.handle)} --json`),
 		) as RunMetadata;
-		updateMetadata(metadata.runDir, {
-			state: remoteMeta.state,
-			error: remoteMeta.error,
-			hasStarted: remoteMeta.hasStarted,
-			settledAt: remoteMeta.settledAt,
-		});
+		syncRemoteRun(metadata, remoteMeta);
 	}
 	const current = readMetadata(metadata.runDir) ?? metadata;
 	if (asJson) {
@@ -482,8 +486,10 @@ function statusSubagent(args: string[]): void {
 	}
 	const attach = isRemote(current) ? remoteAttachCommand(current) : `tmux attach -t ${current.tmuxSession}`;
 	process.stdout.write(
-		`${runDisplayName(current)}: ${effectiveRunState(current)} (${current.provider}/${current.model}, ${current.thinking})${isRemote(current) ? `  @${current.host}` : ""}\nAttach: ${attach}\n`,
+		`${runDisplayName(current)}: ${displayRunState(current)} (${current.provider}/${current.model}, ${current.thinking})${isRemote(current) ? `  @${current.host}` : ""}\nAttach: ${attach}\n`,
 	);
+	const input = activeInput(current);
+	if (input) process.stdout.write(`${inputInstructions(input)}\n`);
 }
 
 function renameSubagent(args: string[]): void {
@@ -532,6 +538,56 @@ function sendSubagent(args: string[]): void {
 	const state = effectiveRunState(metadata);
 	const verb = followUp && state === "busy" ? "Queued follow-up for" : state === "idle" ? "Prompted" : "Steered";
 	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n`);
+}
+
+async function answerSubagent(args: string[]): Promise<void> {
+	const [handle, requestId, flag, value, ...extra] = args;
+	if (!handle || !isRequestId(requestId) || extra.length > 0) usage();
+	let answer: InputAnswer;
+	if (flag === "--cancel" && value === undefined) answer = { kind: "cancel" };
+	else if (flag === "--option" && value && /^\d+$/.test(value)) answer = { kind: "option", option: Number(value) };
+	else if (flag === "--text" && value?.trim()) answer = { kind: "text", text: value.trim() };
+	else fail("answer requires exactly one of --option N, --text TEXT, or --cancel");
+	const metadata = getRun(handle);
+	if (!isDispatchingSession(metadata)) fail("Only the dispatching Pi session may answer (PI_SESSION_ID)");
+	if (isRemote(metadata)) {
+		process.stdout.write(runRemote(metadata.host as string,
+			`PI_SESSION_ID=${shq(process.env.PI_SESSION_ID!)} ${REMOTE_CLI} answer ${args.map(shq).join(" ")}`));
+		const remote = JSON.parse(runRemote(metadata.host as string, `${REMOTE_CLI} status ${shq(handle)} --json`)) as RunMetadata;
+		syncRemoteRun(metadata, remote);
+		return;
+	}
+	const request = activeInput(metadata);
+	if (!request || request.requestId !== requestId) fail("Stale or wrong question request");
+	answer = validateAnswer(answer, request);
+	const replyId = randomUUID();
+	const payload: AnswerMessage = { delivery: "answer", handle, requestId, replyId,
+		parentSessionId: process.env.PI_SESSION_ID!, answer };
+	const queueDir = inboxDir(metadata.runDir);
+	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
+	const target = join(queueDir, `${Date.now()}-${replyId}.json`);
+	const temporary = `${target}.tmp`;
+	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
+	renameSync(temporary, target);
+	const receiptPath = answerReceiptPath(metadata.runDir, replyId);
+	try {
+		const deadline = Date.now() + 10000;
+		while (Date.now() < deadline) {
+			if (existsSync(receiptPath)) {
+				const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as AnswerReceipt;
+				if (!receipt.accepted) fail(receipt.error || "Question answer rejected");
+				acknowledgeInput(metadata.runDir, requestId);
+				process.stdout.write(`Answered ${handle} request ${requestId} as supervisor (task NOT complete)\n`);
+				return;
+			}
+			if (!readMetadata(metadata.runDir) || !tmuxSessionExists(metadata.tmuxSession)) fail("Child exited before acknowledging answer");
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+		}
+		fail("Timed out awaiting answer receipt; delivery is uncertain. Check status before retrying.");
+	} finally {
+		rmSync(target, { force: true });
+		rmSync(receiptPath, { force: true });
+	}
 }
 
 /** Upper bound on how long `interrupt` waits for the child to settle before reporting its state. */
@@ -623,11 +679,8 @@ async function waitSubagent(args: string[]): Promise<void> {
 			const remoteMeta = JSON.parse(
 				runRemote(initial.host as string, `${REMOTE_CLI} status ${shq(handle)} --json`),
 			) as RunMetadata;
-			const patch: Partial<RunMetadata> = {
-				state: remoteMeta.state,
-				error: remoteMeta.error,
-				settledAt: remoteMeta.settledAt,
-			};
+			syncRemoteRun(initial, remoteMeta);
+			const patch: Partial<RunMetadata> = {};
 			// The remote wait marks the token only after it consumed the result. Omitting the
 			// field otherwise preserves a concurrent acknowledgement in the local shadow.
 			if (
@@ -652,6 +705,12 @@ async function waitSubagent(args: string[]): Promise<void> {
 		const state = effectiveRunState(metadata);
 		if (state === "error") fail(metadata.error || `${handle} failed`);
 		if (state === "exited") fail(`${handle} exited before finishing`);
+		const input = activeInput(metadata, state);
+		if (input) {
+			process.stdout.write(`${inputInstructions(input)}\n`);
+			if (isDispatchingSession(metadata)) acknowledgeInput(metadata.runDir, input.requestId);
+			return; // Successful retrieval of attention is not completion, and never acknowledges settlement.
+		}
 		if (metadata.hasStarted && state === "idle" && !pending) {
 			const message = readLatestAssistant(metadata.sessionFile);
 			if (!message) fail(`${handle} finished without an assistant response`);
@@ -867,7 +926,7 @@ function listSubagents(args: string[]): void {
 	}
 	for (const metadata of runs) {
 		process.stdout.write(
-			`${runDisplayName(metadata)}  ${effectiveRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}${isRemote(metadata) ? `  @${metadata.host}` : ""}\n`,
+			`${runDisplayName(metadata)}  ${displayRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}${isRemote(metadata) ? `  @${metadata.host}` : ""}\n`,
 		);
 	}
 }
@@ -887,6 +946,9 @@ async function main(): Promise<void> {
 			break;
 		case "send":
 			sendSubagent(args);
+			break;
+		case "answer":
+			await answerSubagent(args);
 			break;
 		case "interrupt":
 			await interruptSubagent(args);
