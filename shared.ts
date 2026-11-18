@@ -633,6 +633,41 @@ function remoteCallFailure(call: RemoteCall, timeoutMs = REMOTE_CALL_TIMEOUT_MS)
 	return call.stderr.trim().split("\n").pop() || `ssh exit ${call.code}`;
 }
 
+/** What one bounded command on a host gave: its output, or why there is none. */
+export interface BoundedRemoteResult {
+	ok: boolean;
+	stdout: string;
+	/**
+	 * Set when the host's command gave no exit status: the time limit passed, or the ssh
+	 * transport itself failed (exit 255). The command may or may not have run.
+	 */
+	noVerdict?: boolean;
+	/** The reason, for a message to the user, when ok is false. */
+	failure?: string;
+}
+
+/**
+ * Run one command on a host inside the remote-call time limit, for a caller that must tell
+ * "the host said no" from "no answer came". An answer relay is such a caller: past the limit,
+ * or when the connection is lost after the command was sent, the answer may or may not have
+ * reached the child, which is uncertain delivery, not rejection. ssh keeps exit status 255 for
+ * its own failures and passes any other status on from the host's command.
+ */
+export async function runRemoteBounded(
+	host: string,
+	command: string,
+	options: { timeoutMs?: number } = {},
+): Promise<BoundedRemoteResult> {
+	const call = await callRemote(host, command, options);
+	if (call.code === 0 && !call.stopped) return { ok: true, stdout: call.stdout };
+	return {
+		ok: false,
+		stdout: call.stdout,
+		noVerdict: call.stopped !== undefined || call.code === null || call.code === 255,
+		failure: remoteCallFailure(call, options.timeoutMs),
+	};
+}
+
 /** TERM values that are safe to name in a remote command and in a terminfo path. */
 export function isTerminalName(term: string | undefined): term is string {
 	return typeof term === "string" && /^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(term);

@@ -29,6 +29,7 @@ import {
 	removeRunDir,
 	runDisplayName,
 	runRemote,
+	runRemoteBounded,
 	isValidRunName,
 	type HostConfig,
 	type InboxMessage,
@@ -42,7 +43,7 @@ import {
 	writeMetadata,
 } from "./shared.ts";
 
-import { acknowledgeInput, answerReceiptPath, inputInstructions, isRequestId, validateAnswer, type AnswerMessage, type AnswerReceipt, type InputAnswer } from "./input.ts";
+import { acknowledgeInput, answerReceiptPath, inputInstructions, isRequestId, validateAnswer, WAIT_NEEDS_INPUT_EXIT, type AnswerMessage, type AnswerReceipt, type InputAnswer } from "./input.ts";
 
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
@@ -78,8 +79,8 @@ Interrupt presses Escape once in the child's pane, exactly as a human attached t
   turn continues with any queued message. Idle: no effect, but two interrupts within 0.5s
   trigger pi's double-Escape action (the session tree by default); one more closes it.
   Use send to redirect work and stop to end it.
-  Managed questions use answer, not send or Escape. wait returns pending input without
-  reporting task completion; answer resolves that exact question as supervisor input.
+  Managed questions use answer, not send or Escape. wait prints a pending question and exits
+  with status 2 (the task is not complete); answer resolves that exact question as supervisor input.
 
 Remote hosts:
   subagent spawn --host <ssh-alias> [--remote-cwd <dir>] ...   rsyncs --cwd to the host first
@@ -551,10 +552,27 @@ async function answerSubagent(args: string[]): Promise<void> {
 	const metadata = getRun(handle);
 	if (!isDispatchingSession(metadata)) fail("Only the dispatching Pi session may answer (PI_SESSION_ID)");
 	if (isRemote(metadata)) {
-		process.stdout.write(runRemote(metadata.host as string,
-			`PI_SESSION_ID=${shq(process.env.PI_SESSION_ID!)} ${REMOTE_CLI} answer ${args.map(shq).join(" ")}`));
-		const remote = JSON.parse(runRemote(metadata.host as string, `${REMOTE_CLI} status ${shq(handle)} --json`)) as RunMetadata;
-		syncRemoteRun(metadata, remote);
+		const host = metadata.host as string;
+		// The host's verdict on the answer is this command's verdict. The call is bounded. With no
+		// verdict (the limit passed, or the connection failed) the answer may or may not have
+		// reached the child, so that is reported as uncertain delivery, not as a rejection.
+		const relayed = await runRemoteBounded(host,
+			`PI_SESSION_ID=${shq(process.env.PI_SESSION_ID!)} ${REMOTE_CLI} answer ${args.map(shq).join(" ")}`);
+		if (!relayed.ok) {
+			fail(relayed.noVerdict
+				? `No verdict from ${host} (${relayed.failure}); delivery is uncertain. Check status before retrying.`
+				: `Remote command on ${host} failed: ${relayed.failure}`);
+		}
+		process.stdout.write(relayed.stdout);
+		// The answer is accepted. What follows only brings the local shadow up to date, which is
+		// the poll's job anyway, so none of it may turn the accepted answer into a reported failure.
+		try {
+			acknowledgeInput(metadata.runDir, requestId);
+			const status = await runRemoteBounded(host, `${REMOTE_CLI} status ${shq(handle)} --json`);
+			if (status.ok) syncRemoteRun(metadata, JSON.parse(status.stdout) as RunMetadata);
+		} catch {
+			// The poll will refresh it.
+		}
 		return;
 	}
 	const request = activeInput(metadata);
@@ -709,7 +727,10 @@ async function waitSubagent(args: string[]): Promise<void> {
 		if (input) {
 			process.stdout.write(`${inputInstructions(input)}\n`);
 			if (isDispatchingSession(metadata)) acknowledgeInput(metadata.runDir, input.requestId);
-			return; // Successful retrieval of attention is not completion, and never acknowledges settlement.
+			// Attention is not completion and never acknowledges settlement. Its own exit status keeps
+			// zero meaning what it always meant to a caller that branches on it: the turn settled.
+			process.exitCode = WAIT_NEEDS_INPUT_EXIT;
+			return;
 		}
 		if (metadata.hasStarted && state === "idle" && !pending) {
 			const message = readLatestAssistant(metadata.sessionFile);

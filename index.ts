@@ -424,7 +424,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				try {
 					const value: unknown = JSON.parse(readFileSync(path, "utf8"));
 					if (value && typeof value === "object" && (value as AnswerMessage).delivery === "answer") {
-						questions.consumeAnswer(value as AnswerMessage, readMetadata(runDir)?.parentSessionId);
+						const owner = readMetadata(runDir);
+						questions.consumeAnswer(value as AnswerMessage, owner?.parentSessionId, closeRequested || owner?.closing === true);
 						rmSync(path, { force: true });
 						continue;
 					}
