@@ -1,12 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
 import {
+	activeInput,
 	attachWithRecovery,
 	type AttachResult,
+	displayRunState,
 	effectiveRunState,
 	inboxDir,
 	isRemote,
@@ -22,6 +24,7 @@ import {
 	runDisplayName,
 	settlementDelivery,
 	sshAttachTransport,
+	syncRemoteRun,
 	type InboxMessage,
 	type RunMetadata,
 	type RunState,
@@ -29,6 +32,8 @@ import {
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
+
+import { acknowledgeInput, inputInstructions, QUESTION_EVENT, QuestionBridge, type AnswerMessage, type QuestionRequest } from "./input.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -42,7 +47,7 @@ function isInboxMessage(value: unknown): value is InboxMessage {
 }
 
 function displayState(metadata: RunMetadata): string {
-	return effectiveRunState(metadata).padEnd(8);
+	return displayRunState(metadata).padEnd(8);
 }
 
 function latestAssistantStopReason(ctx: ExtensionContext): string | undefined {
@@ -170,13 +175,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const remotePolls = new AbortController();
 		let parentRunAborted = false;
 
-		const notifySettledRuns = (): void => {
+		const notifyParentRuns = (): void => {
 			if (!widgetContext) return;
 			for (const run of listRuns(widgetContext.sessionManager.getSessionId())) {
 				const state = effectiveRunState(run);
 				const previousState = observedStates.get(run.handle);
-				const token = pendingSettlementToken(run, previousState, state);
-				if (!token) {
+				const input = activeInput(run, state);
+				const token = input ? input.requestId : pendingSettlementToken(run, previousState, state);
+				if (!token || (input && run.parentNotifiedInputId === token)) {
 					observedStates.set(run.handle, state);
 					continue;
 				}
@@ -200,20 +206,22 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					pi.sendMessage(
 						{
 							customType: "subagent-state",
-							content:
+							content: input ? inputInstructions(input) :
 								`Subagent ${displayName} finished a turn and is currently ${state}. ` +
 								`Run \`subagent wait ${run.handle}\` now to retrieve its result and continue the delegated work.`,
 							display: true,
-							details: { handle: run.handle, name: run.name, state, settledAt: run.settledAt },
+							details: input ? { handle: run.handle, name: run.name, state, pendingInput: input } :
+								{ handle: run.handle, name: run.name, state, settledAt: run.settledAt },
 						},
 						{ triggerTurn: delivery === "trigger" },
 					);
-					updateMetadata(run.runDir, { parentNotifiedSettledAt: token });
+					if (input) acknowledgeInput(run.runDir, input.requestId);
+					else updateMetadata(run.runDir, { parentNotifiedSettledAt: token });
 					observedStates.set(run.handle, state);
 				} catch (error) {
 					if (widgetContext.hasUI) {
 						widgetContext.ui.notify(
-							`Could not deliver completion from ${displayName}: ${error instanceof Error ? error.message : String(error)}`,
+							`Could not deliver state from ${displayName}: ${error instanceof Error ? error.message : String(error)}`,
 							"error",
 						);
 					}
@@ -239,12 +247,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					for (const run of runs) {
 						const match = remoteAll.find((candidate) => candidate.handle === run.handle);
 						if (match) {
-							updateMetadata(run.runDir, {
-								state: match.state,
-								error: match.error,
-								hasStarted: match.hasStarted,
-								settledAt: match.settledAt,
-							});
+							syncRemoteRun(run, match);
 						} else {
 							removeRunDir(run.runDir);
 						}
@@ -286,7 +289,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const refreshWidget = (): void => {
 			if (!widgetContext?.hasUI) return;
 			const activeRuns = listRuns(widgetContext.sessionManager.getSessionId())
-				.map((run) => ({ run, state: effectiveRunState(run) }))
+				.map((run) => ({ run, state: displayRunState(run) }))
 				.filter(({ state }) => state !== "exited");
 			if (activeRuns.length === 0) {
 				widgetContext.ui.setWidget("subagents", undefined);
@@ -295,7 +298,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 			const visible = activeRuns.slice(0, 5).map(({ run, state }) => {
 				const color =
-					state === "busy" || state === "closing"
+					state === "busy" || state === "closing" || state === "waiting-input"
 						? "warning"
 						: state === "idle"
 							? "success"
@@ -340,13 +343,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			// State monitoring is functional behavior, not UI behavior. One-shot print/JSON
 			// sessions leave settlements pending; TUI/RPC delivery begins on the first timer tick.
 			widgetContext = ctx;
+			parentRunAborted = parentRunWasInterrupted(false, latestAssistantStopReason(ctx));
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
 				observedStates.set(run.handle, effectiveRunState(run));
 			}
 			refreshWidget();
 			refreshRemoteStates();
 			widgetTimer = setInterval(() => {
-				notifySettledRuns();
+				notifyParentRuns();
 				refreshWidget();
 				refreshRemoteStates();
 			}, 1000);
@@ -393,6 +397,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let processing = false;
 	let closeRequested = false;
 	let sessionName: string | undefined;
+	const questions = new QuestionBridge(runDir);
+	let unsubscribeQuestions: (() => void) | undefined;
 
 	const syncSessionName = (): void => {
 		const metadata = readMetadata(runDir);
@@ -417,10 +423,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				let payload: InboxMessage;
 				try {
 					const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+					if (value && typeof value === "object" && (value as AnswerMessage).delivery === "answer") {
+						questions.consumeAnswer(value as AnswerMessage, readMetadata(runDir)?.parentSessionId);
+						rmSync(path, { force: true });
+						continue;
+					}
 					if (!isInboxMessage(value)) throw new Error("Invalid inbox message");
 					payload = value;
 				} catch (error) {
-					unlinkSync(path);
+					// An answer CLI can withdraw its inbox file when its receipt wait times out.
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					rmSync(path, { force: true });
 					updateMetadata(runDir, {
 						state: "error",
 						error: error instanceof Error ? error.message : String(error),
@@ -428,7 +441,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					continue;
 				}
 
-				if (payload.delivery === "close") closeRequested = true;
+				if (payload.delivery === "close") {
+					closeRequested = true;
+					// A follow-up cannot pass a blocked question tool. Invalidate it directly,
+					// then queue the existing cleanup turn without aborting the agent.
+					questions.cancel("Question cancelled: supervisor close");
+				}
 				updateMetadata(runDir, {
 					state: "busy",
 					error: undefined,
@@ -460,6 +478,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		currentContext = ctx;
+		questions.cancel("Question cancelled: child runtime replaced");
+		unsubscribeQuestions?.();
+		unsubscribeQuestions = pi.events.on(QUESTION_EVENT, (data) => {
+			if (!currentContext) return;
+			const metadata = readMetadata(runDir);
+			questions.request(data as QuestionRequest, {
+				handle: metadata?.handle ?? "", parentSessionId: metadata?.parentSessionId,
+				closing: closeRequested || metadata?.closing,
+			});
+		});
 		const metadata = readMetadata(runDir);
 		if (!metadata) return;
 		updateMetadata(runDir, {
@@ -496,6 +524,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (event) => {
 		currentContext = undefined;
+		unsubscribeQuestions?.();
+		unsubscribeQuestions = undefined;
+		questions.cancel("Question cancelled: child shutdown or reload");
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;
