@@ -27,6 +27,7 @@ import {
 	REMOTE_CLI,
 	remoteAttachCommand,
 	removeRunDir,
+	resumeRun,
 	runDisplayName,
 	runRemote,
 	runRemoteBounded,
@@ -59,6 +60,7 @@ function usage(): never {
     [--no-prompt-templates] [--no-context-files] [--discard-transcript]
     (--prompt <text> | --file <path>)...
   subagent status <handle> [--json]
+  subagent resume <handle> [--json]
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
   subagent answer <handle> <request-id> (--option N | --text TEXT | --cancel)
@@ -482,7 +484,7 @@ function statusSubagent(args: string[]): void {
 	}
 	const current = readMetadata(metadata.runDir) ?? metadata;
 	if (asJson) {
-		process.stdout.write(`${JSON.stringify(current)}\n`);
+		process.stdout.write(`${JSON.stringify({ ...current, state: effectiveRunState(current) })}\n`);
 		return;
 	}
 	const attach = isRemote(current) ? remoteAttachCommand(current) : `tmux attach -t ${current.tmuxSession}`;
@@ -491,6 +493,38 @@ function statusSubagent(args: string[]): void {
 	);
 	const input = activeInput(current);
 	if (input) process.stdout.write(`${inputInstructions(input)}\n`);
+}
+
+async function resumeSubagent(args: string[]): Promise<void> {
+	const [handle, flag, ...extra] = args;
+	if (!handle || (flag !== undefined && flag !== "--json") || extra.length) usage();
+	const run = getRun(handle);
+	if (!isDispatchingSession(run)) fail("Only the dispatching Pi session may resume (PI_SESSION_ID)");
+	let resumed: RunMetadata;
+	if (isRemote(run)) {
+		const host = run.host!;
+		// The short handle can be reused after teardown. Check its incarnation on
+		// the execution host before starting anything, not merely on the reply.
+		const command = `PI_SESSION_ID=${shq(process.env.PI_SESSION_ID!)} PI_SUBAGENT_RESUME_CREATED_AT=${shq(run.createdAt)} ${REMOTE_CLI} resume ${shq(handle)} --json`;
+		const reply = await runRemoteBounded(host, command);
+		if (!reply.ok) fail(reply.noVerdict
+			? `Recovery on ${host} not confirmed (${reply.failure}); check status before retrying`
+			: `Could not resume ${handle} on ${host}: ${reply.failure}`);
+		const worker = JSON.parse(reply.stdout) as RunMetadata;
+		if (worker.handle !== handle || worker.createdAt !== run.createdAt || !isDispatchingSession(worker)) {
+			fail(`Unexpected recovery record from ${host}; inspect the run on the host`);
+		}
+		resumed = { ...worker, host, runDir: run.runDir, cwd: run.cwd, remoteCwd: run.remoteCwd, syncSource: run.syncSource,
+			parentSessionFile: run.parentSessionFile };
+		try { syncRemoteRun(run, worker); }
+		catch { process.stderr.write("Child resumed; the local status snapshot could not be refreshed.\n"); }
+	} else {
+		const expected = process.env.PI_SUBAGENT_RESUME_CREATED_AT;
+		if (expected !== undefined && expected !== run.createdAt) fail(`The run recorded on this host is not the original ${handle}`);
+		resumed = await resumeRun(run);
+	}
+	process.stdout.write(flag === "--json" ? `${JSON.stringify(resumed)}\n` :
+		`Resumed ${runDisplayName(resumed)}${run.host ? ` on ${run.host}` : ""}\nState: ${displayRunState(resumed)}\n${transcriptLine(resumed, run.host)}\n`);
 }
 
 function renameSubagent(args: string[]): void {
@@ -938,7 +972,7 @@ function listSubagents(args: string[]): void {
 	if (rest.length !== 0) usage();
 	const runs = listRuns(process.env.PI_SESSION_ID || undefined);
 	if (asJson) {
-		process.stdout.write(`${JSON.stringify(runs)}\n`);
+		process.stdout.write(`${JSON.stringify(runs.map(run => ({ ...run, state: effectiveRunState(run) })))}\n`);
 		return;
 	}
 	if (runs.length === 0) {
@@ -961,6 +995,9 @@ async function main(): Promise<void> {
 			break;
 		case "status":
 			statusSubagent(args);
+			break;
+		case "resume":
+			await resumeSubagent(args);
 			break;
 		case "rename":
 			renameSubagent(args);

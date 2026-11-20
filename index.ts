@@ -491,7 +491,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		});
 		const metadata = readMetadata(runDir);
 		if (!metadata) return;
+		// Reopening history does not complete the interrupted turn. Wait for a new
+		// dispatch rather than returning an old assistant message as a fresh result.
+		const resumedLaunch = process.env.PI_SUBAGENT_RESUMING;
+		delete process.env.PI_SUBAGENT_RESUMING;
 		updateMetadata(runDir, {
+			...(resumedLaunch ? { resumedLaunch, paneId: process.env.TMUX_PANE, hasStarted: false, settledAt: undefined, parentNotifiedSettledAt: undefined } : {}),
 			childSessionId: ctx.sessionManager.getSessionId(),
 			sessionFile: ctx.sessionManager.getSessionFile() ?? metadata.sessionFile,
 			state: ctx.isIdle() ? "idle" : "busy",

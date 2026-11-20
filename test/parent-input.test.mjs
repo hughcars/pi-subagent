@@ -114,6 +114,31 @@ async function eventually(predicate) {
 	assert.fail("Expected condition did not become true");
 }
 
+integration("recovery cancels a lost question and publishes fresh readiness without replaying the last turn", async t => {
+	const f = fixture(t);
+	updateMetadata(f.runDir, { settledAt: "old", parentNotifiedSettledAt: "old", paneId: "%3" });
+	writePendingInput(f.runDir, { version: 1, handle: "abc123", requestId: randomUUID(), question: "Lost question?",
+		options: [{ label: "Yes" }], createdAt: new Date().toISOString() });
+	const oldPane = process.env.TMUX_PANE;
+	try {
+		process.env.TMUX_PANE = "%9";
+		process.env.PI_SUBAGENT_RESUMING = "this-launch";
+		const child = await harness(t, f, { child: true, idle: true });
+		const fresh = readMetadata(f.runDir);
+		assert.deepEqual([fresh.state, fresh.hasStarted, fresh.settledAt, fresh.parentNotifiedSettledAt, fresh.paneId, fresh.resumedLaunch],
+			["idle", false, undefined, undefined, "%9", "this-launch"]);
+		assert.equal(fresh.pendingInput, undefined);
+		assert.deepEqual(child.prompts, []);
+		await child.emit("agent_start"); await child.emit("agent_settled");
+		assert.ok(readMetadata(f.runDir).settledAt);
+		await child.stop(); await harness(t, f, { child: true, idle: true });
+		assert.equal(readMetadata(f.runDir).hasStarted, true, "reload is not another recovery");
+	} finally {
+		delete process.env.PI_SUBAGENT_RESUMING;
+		if (oldPane === undefined) delete process.env.TMUX_PANE; else process.env.TMUX_PANE = oldPane;
+	}
+});
+
 integration("busy child wakes only its dispatching parent; CLI answer resolves the ORIGINAL question without a prompt", async (t) => {
 	const f = fixture(t), child = await harness(t, f, { child: true }), parent = await harness(t, f);
 	const other = await harness(t, f, { sessionId: "unrelated" });

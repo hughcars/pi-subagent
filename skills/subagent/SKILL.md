@@ -74,6 +74,12 @@ Run `subagent list` at any time to rediscover active subagents and their handles
 
 `wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline. Use a blocking wait only when the result is required in the current turn; do not build a polling or process-monitor ceremony solely to notice completion, because the automatic `subagent-state` message does that.
 
+## Recover an interrupted worker
+
+If the worker is reachable again, check `subagent status <handle>`. Attach if its pane survived. If the pane is gone, run `subagent resume <handle>` from the dispatching Pi session. This needs the original control record, session file and workspace on the host; a transcript kept by `stop` alone is not enough. The host must already have the recovery-capable CLI and extension.
+
+Resume confirms the new child has opened the same session. It does not replay a prompt or the lost turn. Send an instruction to check the work on disk, then use `wait` for the new result. Do not repeat a possibly completed side effect merely because the connection was interrupted.
+
 ## Answer pending questions
 
 A child that needs a decision from you calls its `question` tool; when a decision is likely, say so in its prompt. You answer with `subagent answer`. This also works when the child has an active goal: the call waits inside the child's turn, so the goal cannot go on past the question until you answer. Do not ask a child to end its turn or write its question to a file instead.

@@ -132,13 +132,27 @@ Optional spawn flags:
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes the run's control state permanently.
 
+### Recover a child after a worker reboot
+
+Reconnect to the worker first. A lost SSH connection alone is not a reason to restart a child. If its tmux session is gone, the dispatching Pi session can run:
+
+```sh
+subagent resume <handle>
+subagent send <handle> "Check which outputs reached disk before continuing."
+subagent wait <handle>
+```
+
+Resume starts a new tmux pane in the saved workspace with the same handle, Pi transcript and launch settings. It does not sync the workspace, replay the original prompt, or restart an interrupted command. It waits for the control extension to confirm the session ID. The old turn is not a new completion. A lost question is cancelled; if the inbox holds undelivered messages, resume leaves them in place and refuses to start. Inspect them on the host before moving them aside.
+
+The execution host needs a CLI and control extension with this verb. A run already alive should be attached to, not resumed. A stopped run cannot be resumed by handle: its retained transcript is history, not a control record. A failure to contact the host is not proof the launch failed; check status before retrying.
+
 ## Transcripts
 
 Each run's transcript has a private, stable path under `<session-root>/subagents/`, where session-root is `PI_CODING_AGENT_SESSION_DIR` or `<agent-dir>/sessions`. Spawn prints it. When a run is torn down, by `stop` or by its parent discarding a child that exited on its own, a non-empty transcript is kept there unless the run was spawned with `--discard-transcript`, which deletes the file spawn allocated; `stop` prints which, and says so if the child had switched to another session file, which is left in place. Empty files from a launch that wrote nothing are removed. A run spawned before transcripts moved out of the run directory has its transcript linked into session storage before that directory is removed, and a failure to do so leaves both the transcript and the control state in place. Kept transcripts are not active runs and `subagent list` does not show them. A remote run's transcript follows the same rule on its execution host; nothing is copied back.
 
 ## Remote hosts
 
-A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, answer, interrupt, wait, stop, rename) is forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t`. Hosts are configured in `~/.pi/agent/subagent.json`:
+A subagent can run on another machine over ssh. The working directory is rsynced to the host at spawn time, the child runs in the host's tmux, and every management command (status, send, answer, interrupt, wait, stop, rename, resume) is forwarded over ssh. Remote runs appear in `subagent list` and `/subagent` like local ones, marked `@<host>`, and attach through `ssh -t`. Hosts are configured in `~/.pi/agent/subagent.json`:
 
 ```json
 {

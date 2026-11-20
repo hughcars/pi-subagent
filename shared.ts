@@ -11,6 +11,7 @@ import {
 	openSync,
 	realpathSync,
 	statSync,
+	readSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
@@ -87,6 +88,8 @@ export interface RunMetadata {
 	thinking: string;
 	/** Extra pi CLI flags (tools, isolation) reused when the run is relaunched. */
 	launchArgs?: string[];
+	/** Last explicit relaunch acknowledged by the child's session_start hook. */
+	resumedLaunch?: string;
 	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
 	suspended?: boolean;
 	/** Set when a supervisor close was delivered; the child exits after its final cleanup turn. */
@@ -378,18 +381,73 @@ export function tmuxSessionExists(session: string): boolean {
 	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
 }
 
+/** Read just Pi's JSONL header. Never let --session silently open a fresh conversation. */
+function savedSessionId(path: string): string {
+	if (!statSync(path, { throwIfNoEntry: false })?.isFile()) throw new Error(`Missing or non-regular session file: ${path}`);
+	const fd = openSync(path, "r");
+	try {
+		const buffer = Buffer.alloc(4096);
+		const parts: Buffer[] = [];
+		// Pi's normal session-header bound is 1 MiB. Don't read a damaged or
+		// newline-free multi-GB transcript into memory to check its identity.
+		for (;;) {
+			if (parts.length * buffer.length >= 1024 * 1024) throw new Error("session header too long");
+			const n = readSync(fd, buffer, 0, buffer.length, null);
+			const line = buffer.subarray(0, n);
+			const end = line.indexOf(10);
+			parts.push(Buffer.from(end < 0 ? line : line.subarray(0, end)));
+			if (end >= 0 || n === 0) break;
+		}
+		const header = JSON.parse(Buffer.concat(parts).toString("utf8"));
+		if (header?.type !== "session" || typeof header.id !== "string" || !header.id || typeof header.cwd !== "string") throw new Error("invalid header");
+		return header.id;
+	} catch (error) {
+		throw new Error(`No readable Pi session header in ${path}: ${String(error)}`);
+	} finally { closeSync(fd); }
+}
+
+/** Recover the run on its execution host. A stopped run has no control record to recover. */
+export async function resumeRun(run: RunMetadata): Promise<RunMetadata> {
+	if (isRemote(run)) throw new Error("Resume must run on the execution host");
+	if (run.closing || run.forceStopped || run.state === "closing") throw new Error(`${run.handle} is being stopped`);
+	if (tmuxSessionExists(`=${run.tmuxSession}`)) throw new Error(`${run.handle} is already running; attach or send to it`);
+	if (!statSync(run.cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Missing working directory: ${run.cwd}`);
+	const id = savedSessionId(run.sessionFile);
+	if (run.childSessionId && run.childSessionId !== id) throw new Error(`Session ID does not match the recorded child: ${run.sessionFile}`);
+	const inbox = inboxDir(run.runDir);
+	if (existsSync(inbox) && readdirSync(inbox).some(name => name.endsWith(".json"))) {
+		throw new Error(`Undelivered messages in ${inbox}; inspect and move them aside before resuming`);
+	}
+	// tmux owns the unique session name. If two callers race, only the winning
+	// child publishes a receipt. A failed launch must not reset the old state.
+	const token = randomUUID();
+	launchRun(run, [], token);
+	const deadline = Date.now() + 15000;
+	do {
+		const current = readMetadata(run.runDir);
+		if (!current || !tmuxSessionExists(`=${run.tmuxSession}`)) throw new Error(`Recovered child ${run.handle} exited before startup was confirmed`);
+		if (current.resumedLaunch === token && current.childSessionId === id) return current;
+		await new Promise(resolve => setTimeout(resolve, 100));
+	} while (Date.now() < deadline);
+	throw new Error(`Started tmux for ${run.handle}, but Pi has not confirmed its saved session; attach to inspect it`);
+}
+
 /**
  * Start the child pi process for a run in its tmux session and record its pane id in the
  * metadata. `initialArgs` are only passed on first spawn.
  */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+export function launchRun(metadata: RunMetadata, initialArgs: string[] = [], resumeToken?: string): void {
 	let launcher = "pi";
-	const testLauncher = join(metadata.cwd, "pi-test.sh");
-	try {
-		accessSync(testLauncher, constants.X_OK);
-		launcher = testLauncher;
-	} catch {
-		// Use the installed pi executable.
+	// Recovery always opens the recorded conversation in Pi. Don't switch to a
+	// launcher that may have appeared in the work tree since the original spawn.
+	if (!resumeToken) {
+		const testLauncher = join(metadata.cwd, "pi-test.sh");
+		try {
+			accessSync(testLauncher, constants.X_OK);
+			launcher = testLauncher;
+		} catch {
+			// Use the installed pi executable.
+		}
 	}
 
 	const result = spawnSync(
@@ -411,6 +469,7 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 			"--",
 			"env",
 			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+			...(resumeToken ? [`PI_SUBAGENT_RESUMING=${resumeToken}`] : []),
 			launcher,
 			"--session",
 			metadata.sessionFile,
@@ -425,7 +484,10 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		],
 		{ encoding: "utf8" },
 	);
-	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
+	if (result.status !== 0) throw new Error(result.stderr?.trim() || "Failed to create tmux session");
+	// A recovering child publishes its new pane and readiness together. Do not
+	// race that acknowledgement with a second metadata read-modify-write here.
+	if (resumeToken) return;
 	// The child writes its metadata first in session_start, after pi has loaded, so this
 	// write lands before it. Relaunches record their new pane the same way; if tmux printed
 	// no pane id, the stale one is cleared so interrupt falls back to the first pane.
@@ -478,6 +540,7 @@ export function displayRunState(metadata: RunMetadata): string {
 export function syncRemoteRun(local: RunMetadata, remote: RunMetadata): void {
 	updateMetadata(local.runDir, {
 		state: remote.state, error: remote.error, hasStarted: remote.hasStarted, settledAt: remote.settledAt,
+		paneId: remote.paneId, childSessionId: remote.childSessionId, sessionFile: remote.sessionFile,
 	});
 	const input = isPendingInput(remote.pendingInput) && remote.pendingInput.handle === local.handle ? remote.pendingInput : undefined;
 	writePendingInput(local.runDir, input);
