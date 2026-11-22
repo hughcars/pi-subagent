@@ -24,6 +24,7 @@ import {
 	runDisplayName,
 	settlementDelivery,
 	shortModelName,
+	subagentRole,
 	sshAttachTransport,
 	syncRemoteRun,
 	type InboxMessage,
@@ -61,7 +62,10 @@ function latestAssistantStopReason(ctx: ExtensionContext): string | undefined {
 }
 
 export default function subagentExtension(pi: ExtensionAPI) {
-	const runDir = process.env.PI_SUBAGENT_RUN_DIR;
+	const role = subagentRole();
+	// A Pi started under a managed child can't spawn subagents and doesn't own the child's run.
+	if (role.kind === "nested") return;
+	const runDir = role.kind === "child" ? role.runDir : undefined;
 	if (!runDir) {
 		pi.on("resources_discover", () => ({ skillPaths: [join(packageDir, "skills")] }));
 	}

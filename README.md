@@ -130,7 +130,7 @@ Optional spawn flags:
 - `--no-context-files`: ignore repository instruction files
 - `--discard-transcript`: delete the transcript at `stop` instead of keeping it
 
-Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes the run's control state permanently.
+Nested subagents are disabled. Child sessions do not receive the subagent skill. A Pi started from inside a child, such as a `pi` run from its bash tool, loads none of this extension and leaves the child's run alone. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes the run's control state permanently.
 
 ### Recover a child after a worker reboot
 

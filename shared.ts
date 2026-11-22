@@ -27,6 +27,29 @@ export type RunState = "starting" | "busy" | "idle" | "closing" | "exited" | "er
 /** Default seconds `stop` waits for a closing subagent's final cleanup turn. */
 export const DEFAULT_GRACE_SECONDS = 900;
 
+/** The pid of the Pi process that owns a managed run, recorded by that process itself. */
+export const OWNER_PID_ENV = "PI_SUBAGENT_OWNER_PID";
+
+export type SubagentRole = { kind: "parent" } | { kind: "child"; runDir: string } | { kind: "nested" };
+
+/**
+ * The part this Pi process plays. launchRun starts a managed child with PI_SUBAGENT_RUN_DIR,
+ * and every process the child starts inherits it: a `pi` run from its bash tool, or the
+ * helper agents of another package. Only the first Pi process to see it is the child, and it
+ * records its pid in the environment, so a /reload of that process stays the child while a
+ * descendant, with another pid, is "nested" and must leave the run directory alone (one that
+ * took itself for the child overwrote metadata.json and reported the run as exited).
+ * `env` is updated in place.
+ */
+export function subagentRole(env: NodeJS.ProcessEnv = process.env, pid: number = process.pid): SubagentRole {
+	const runDir = env.PI_SUBAGENT_RUN_DIR;
+	if (!runDir) return { kind: "parent" };
+	const owner = env[OWNER_PID_ENV];
+	if (owner === undefined) env[OWNER_PID_ENV] = String(pid);
+	else if (owner !== String(pid)) return { kind: "nested" };
+	return { kind: "child", runDir };
+}
+
 /** Delivered to a subagent when its supervisor stops it: clean up, then report. */
 export const CLOSE_MESSAGE =
 	"Supervisor close: this subagent is being closed by its supervisor. Stop starting new work. " +
@@ -495,6 +518,10 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = [], res
 			metadata.cwd,
 			"--",
 			"env",
+			// The tmux server's environment may come from a managed child: its owner pid is not
+			// this child's (see subagentRole).
+			"-u",
+			OWNER_PID_ENV,
 			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
 			...(resumeToken ? [`PI_SUBAGENT_RESUMING=${resumeToken}`] : []),
 			launcher,
