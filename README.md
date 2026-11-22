@@ -117,7 +117,7 @@ After an interrupt, the child takes `send` as normal.
 
 `interrupt` refuses a child that `stop` is closing. Escape would move the close prompt into the editor, and the child would exit without its cleanup turn. Use `stop --force` instead.
 
-Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs), a short name for the model and thinking level the run was spawned with, and the current state, for example `build[opus 5.5 xhigh]:busy@box`.
 
 ## Isolation
 
@@ -173,7 +173,7 @@ The ssh alias must work non-interactively (BatchMode) and carries the transport 
 
 Attaching to a remote run needs the host to know your terminal type. ssh passes the local `TERM`, and tmux refuses a client whose `TERM` has no terminfo entry on the host (`missing or unsuitable terminal: xterm-kitty`), so the attach ends at once. When a `/subagent` attach to a remote run fails, the extension checks the cause on the host and reports it: host unreachable, tmux session gone, or unknown terminal. For an unknown terminal it copies the local entry into the host user's `~/.terminfo` (`infocmp -a -x` here, `tic -x` there; no root needed) and attaches again. If the entry cannot be installed, it attaches with `TERM=xterm-256color`. The `ssh -t <host> tmux attach-session ...` command that `spawn` and `status` print has no such recovery; when the host refuses your terminal, prefix that command with `TERM=xterm-256color`.
 
-The parent learns a remote run's state by asking its host every 20 s, and the "finished a turn" notification follows from that answer. A host that does not answer keeps its last known states. Once it has been silent for a minute the status widget dims its runs and adds the age of what it shows, for example `build:busy@box (no answer 3m)`, and after three failed polls in a row a warning gives the reason. The state is then unconfirmed: the run may have finished. `subagent status <handle>` asks the host directly. Each host is asked on its own schedule, so a slow or dead host does not delay another. A poll allows 30 s to connect and 45 s in all; at that limit, or when the session ends, its ssh process group is ended.
+The parent learns a remote run's state by asking its host every 20 s, and the "finished a turn" notification follows from that answer. A host that does not answer keeps its last known states. Once it has been silent for a minute the status widget dims its runs and adds the age of what it shows, for example `build[opus 5.5 xhigh]:busy@box (no answer 3m)`, and after three failed polls in a row a warning gives the reason. The state is then unconfirmed: the run may have finished. `subagent status <handle>` asks the host directly. Each host is asked on its own schedule, so a slow or dead host does not delay another. A poll allows 30 s to connect and 45 s in all; at that limit, or when the session ends, its ssh process group is ended.
 
 `subagent hosts` lists the configured registry with live reachability and active run counts, so callers can discover usable hosts before spawning. Creating new compute is not this tool's job — discover first, provision only when nothing is usable.
 
