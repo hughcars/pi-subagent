@@ -298,7 +298,8 @@ async function startParent(t) {
 
 test("a remote run that goes idle wakes its parent once", { skip }, async (t) => {
 	const host = fakeSsh(t);
-	const shadow = run(host.root, "abc123", "box");
+	// A named run with a real model ID, so the widget test sees the short model name.
+	const shadow = run(host.root, "abc123", "box", { name: "my agent", model: "global.anthropic.claude-opus-5-5", thinking: "xhigh" });
 	writeMetadata(shadow);
 	host.answer("box", [{ ...shadow, state: "idle", settledAt: SETTLED_AT }]);
 
@@ -314,7 +315,18 @@ test("a remote run that goes idle wakes its parent once", { skip }, async (t) =>
 
 	await new Promise((resolveDelay) => setTimeout(resolveDelay, 2200));
 	assert.equal(seen.sent.length, 1, "later ticks do not repeat the message");
-	assert.equal(seen.widgets.at(-1)[1][0], "subagents: abc123:idle@box");
+	assert.equal(seen.widgets.at(-1)[1][0], "subagents: my agent[opus 5.5 xhigh]:idle@box");
+});
+
+test("a run record without a model is shown without one, and monitoring still starts", { skip }, async (t) => {
+	const host = fakeSsh(t);
+	const { model: _model, ...shadow } = run(host.root, "abc123", "box");
+	writeMetadata(shadow);
+	host.answer("box", [{ ...shadow, state: "idle", settledAt: SETTLED_AT }]);
+
+	const { seen, until } = await startParent(t);
+	assert.equal(seen.widgets.at(-1)[1][0], "subagents: abc123:busy@box");
+	assert.ok(await until(() => seen.sent.length > 0, 5000), "the parent is still told that the run settled");
 });
 
 test("hosts are polled at the same time, so one slow host does not delay another", { skip }, async (t) => {
@@ -339,7 +351,7 @@ test("a host that does not answer leaves the last state in place and wakes nobod
 	const { seen, until } = await startParent(t);
 	assert.equal(await until(() => seen.sent.length > 0, 2500), false, "no message without an answer from the host");
 	assert.equal(readMetadata(shadow.runDir).state, "busy");
-	assert.equal(seen.widgets.at(-1)[1][0], "subagents: abc123:busy@down", "one failed poll is not yet a silent host");
+	assert.equal(seen.widgets.at(-1)[1][0], "subagents: abc123[test off]:busy@down", "one failed poll is not yet a silent host");
 	assert.deepEqual(seen.notices, [], "and not yet an outage");
 	assert.ok(host.commands().length >= 1);
 });
@@ -382,9 +394,9 @@ test("a host that stays silent is reported once, and its last state is marked wi
 		"Cannot confirm the subagents on down: ssh: connect to host down port 22: Connection timed out. Their shown states are unconfirmed until the host answers.",
 	]]);
 	await seconds(REMOTE_STALE_MS / 1000 - 2 * (REMOTE_POLL_MS / 1000));
-	assert.equal(widget(), "subagents: abc123:busy@down", "not marked at the stale time");
+	assert.equal(widget(), "subagents: abc123[test off]:busy@down", "not marked at the stale time");
 	await seconds(2);
-	assert.equal(widget(), "subagents: [muted]abc123:busy@down (no answer 1m)", "marked and dimmed after it");
+	assert.equal(widget(), "subagents: [muted]abc123[test off]:busy@down (no answer 1m)", "marked and dimmed after it");
 
 	// The host answers again: the mark goes, the parent is told about the settled run, and
 	// the warning is not repeated.
@@ -396,7 +408,7 @@ test("a host that stays silent is reported once, and its last state is marked wi
 	}
 	assert.deepEqual(seen.sent.map(({ message }) => [message.details.handle, message.details.state]), [["abc123", "idle"]]);
 	await seconds(1);
-	assert.equal(widget(), "subagents: abc123:idle@down");
+	assert.equal(widget(), "subagents: abc123[test off]:idle@down");
 	assert.equal(seen.notices.length, 1);
 });
 

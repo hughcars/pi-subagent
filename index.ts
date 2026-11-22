@@ -23,6 +23,7 @@ import {
 	removeRunDir,
 	runDisplayName,
 	settlementDelivery,
+	shortModelName,
 	sshAttachTransport,
 	syncRemoteRun,
 	type InboxMessage,
@@ -308,7 +309,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				// A host that stopped answering: say how old the shown state is, and dim it.
 				const silentFor = isRemote(run) ? remoteContact.silentFor(run.host as string, Date.now()) : undefined;
 				const suffix = isRemote(run) ? `@${run.host}${remoteSilenceNote(silentFor)}` : "";
-				return widgetContext!.ui.theme.fg(silentFor === undefined ? color : "muted", `${run.name ?? run.handle}:${state}${suffix}`);
+				// readMetadata does not check model, a display field; a record without one must not
+				// throw here, because that stops monitoring of every run in this session.
+				const model = typeof run.model === "string" ? `[${shortModelName(run.model)} ${run.thinking}]` : "";
+				return widgetContext!.ui.theme.fg(silentFor === undefined ? color : "muted", `${run.name ?? run.handle}${model}:${state}${suffix}`);
 			});
 			if (activeRuns.length > visible.length) {
 				visible.push(widgetContext.ui.theme.fg("muted", `+${activeRuns.length - visible.length}`));

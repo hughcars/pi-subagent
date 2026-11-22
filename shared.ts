@@ -191,6 +191,33 @@ export function runDisplayName(metadata: RunMetadata): string {
 	return metadata.name ? `${metadata.name} (${metadata.handle})` : metadata.handle;
 }
 
+/**
+ * A short model name for the one-line status widget: `global.anthropic.claude-opus-5-5` is
+ * `opus 5.5`. Display only, from the ID alone: a remote run's provider may not be in this
+ * session's model registry. When a rule is unsure, it keeps text rather than drops it.
+ */
+export function shortModelName(model: string): string {
+	let name = model
+		.slice(model.lastIndexOf("/") + 1) // router namespace: anthropic/claude-opus-4.5
+		// Bedrock region and vendor: global.anthropic. The lookahead needs a model word after
+		// them, so deepseek.v3 and llama.cpp keep their first segment.
+		.replace(/^(?:[a-z-]+\.)+(?=[a-z]{2}[a-z0-9]*-)/, "")
+		// Bedrock model version: -v1:0. Without the colon, -v2 can be a real model version
+		// (nemotron-nano-12b-v2), so it is removed only from Claude IDs below.
+		.replace(/-v\d+:\d+$/, "")
+		.replace(/-\d{8}$/, ""); // release date: -20251101
+	if (name.startsWith("claude-")) {
+		// Claude IDs always write version digits with hyphens (opus-5-5 is Opus 5.5). Others
+		// sometimes do (mistral-medium-3-5), but there a hyphen between digits can also separate
+		// fields (qwen3-235b), so only Claude IDs are joined. A date is never a version part.
+		name = name
+			.slice("claude-".length)
+			.replace(/-v\d+$/, "") // anthropic.claude-opus-4-6-v1
+			.replace(/(?<=\d)-(?=\d{1,2}(?!\d))/g, ".");
+	}
+	return name.replaceAll("-", " ") || model;
+}
+
 export function readMetadata(runDir: string): RunMetadata | undefined {
 	try {
 		const value: unknown = JSON.parse(readFileSync(metadataPath(runDir), "utf8"));
