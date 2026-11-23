@@ -18,6 +18,10 @@ test("only the first Pi process of a managed run is its child, also after a relo
 	const inherited = { ...env };
 	assert.deepEqual(subagentRole(inherited, 11), { kind: "nested" });
 	assert.deepEqual(inherited, env);
+	// An empty owner is no owner, as an empty run directory is no run.
+	const empty = { PI_SUBAGENT_RUN_DIR: "/runs/abc123", [OWNER_PID_ENV]: "" };
+	assert.deepEqual(subagentRole(empty, 12), { kind: "child", runDir: "/runs/abc123" });
+	assert.equal(empty[OWNER_PID_ENV], "12");
 });
 
 test("a process started by the child inherits the run directory and is nested", () => {

@@ -33,9 +33,12 @@ const params = { question: "Which approach?", options: [
 
 function fixture(t) {
 	const root = mkdtempSync(join(tmpdir(), "pi-parent-input-test-"));
-	const saved = { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_SUBAGENT_RUN_DIR: process.env.PI_SUBAGENT_RUN_DIR, PATH: process.env.PATH };
+	const saved = { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_SUBAGENT_RUN_DIR: process.env.PI_SUBAGENT_RUN_DIR,
+		PI_SUBAGENT_OWNER_PID: process.env.PI_SUBAGENT_OWNER_PID, PATH: process.env.PATH };
 	process.env.PI_CODING_AGENT_DIR = root;
 	delete process.env.PI_SUBAGENT_RUN_DIR;
+	// Run under a managed child, the suite inherits its owner pid, which would make every harness child nested.
+	delete process.env.PI_SUBAGENT_OWNER_PID;
 	const bin = join(root, "bin");
 	mkdirSync(bin);
 	writeFileSync(join(bin, "tmux"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
@@ -113,6 +116,18 @@ async function eventually(predicate) {
 	for (let i = 0; i < 150; i++) { if (predicate()) return; await new Promise((r) => setTimeout(r, 10)); }
 	assert.fail("Expected condition did not become true");
 }
+
+integration("a Pi started under the child leaves the run's metadata alone", async t => {
+	const f = fixture(t);
+	const before = readFileSync(join(f.runDir, "metadata.json"), "utf8");
+	// The child process recorded another pid: this Pi was started under it.
+	process.env.PI_SUBAGENT_OWNER_PID = String(process.pid + 1);
+	const nested = await harness(t, f, { child: true, idle: true });
+	await nested.emit("agent_start");
+	await nested.emit("agent_settled");
+	await nested.emit("session_shutdown", { reason: "quit" });
+	assert.equal(readFileSync(join(f.runDir, "metadata.json"), "utf8"), before);
+});
 
 integration("recovery cancels a lost question and publishes fresh readiness without replaying the last turn", async t => {
 	const f = fixture(t);

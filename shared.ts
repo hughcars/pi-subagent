@@ -45,7 +45,7 @@ export function subagentRole(env: NodeJS.ProcessEnv = process.env, pid: number =
 	const runDir = env.PI_SUBAGENT_RUN_DIR;
 	if (!runDir) return { kind: "parent" };
 	const owner = env[OWNER_PID_ENV];
-	if (owner === undefined) env[OWNER_PID_ENV] = String(pid);
+	if (!owner) env[OWNER_PID_ENV] = String(pid);
 	else if (owner !== String(pid)) return { kind: "nested" };
 	return { kind: "child", runDir };
 }
